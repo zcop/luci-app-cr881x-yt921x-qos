@@ -3,6 +3,18 @@
 set -eu
 
 YT_CMD="/sys/kernel/debug/yt921x_cmd"
+PORT_MAX=4
+
+RATE_SCALE_NUM=1535
+RATE_SCALE_DEN=1000
+RATE_OFFSET=130
+EIR_MIN_SAFE=300
+EIR_MAX=262143
+
+EBS_UNIT=64
+EBS_MAX=16383
+DEFAULT_BURST_BYTES=65536
+
 ensure_debugfs() {
 	if [ ! -d /sys/kernel/debug ]; then
 		return 1
@@ -17,14 +29,146 @@ ensure_debugfs() {
 	[ -w "$YT_CMD" ] && [ -r "$YT_CMD" ]
 }
 
+require_uinteger() {
+	local name="$1"
+	local value="$2"
+
+	case "$value" in
+	''|*[!0-9]*)
+		echo "error: invalid $name '$value'" >&2
+		return 1
+		;;
+	esac
+
+	return 0
+}
+
+require_port() {
+	local port="$1"
+
+	require_uinteger port "$port" || return 1
+	if [ "$port" -gt "$PORT_MAX" ]; then
+		echo "error: port out of range (0..$PORT_MAX): $port" >&2
+		return 1
+	fi
+
+	return 0
+}
+
+run_cmd() {
+	local cmd="$1"
+	local out
+
+	printf '%s\n' "$cmd" >"$YT_CMD"
+	out="$(cat "$YT_CMD" 2>/dev/null || true)"
+	printf '%s\n' "$out"
+
+	case "$out" in
+	err=*|*"\nerr="*)
+		return 1
+		;;
+	esac
+
+	return 0
+}
+
+rate_kbps_to_eir() {
+	local rate_kbps="$1"
+	local eir
+
+	require_uinteger rate_kbps "$rate_kbps" || return 1
+	if [ "$rate_kbps" -eq 0 ]; then
+		echo "error: rate_kbps must be > 0" >&2
+		return 1
+	fi
+
+	eir=$(( (rate_kbps * RATE_SCALE_NUM + (RATE_SCALE_DEN / 2)) / RATE_SCALE_DEN + RATE_OFFSET ))
+	if [ "$eir" -lt "$EIR_MIN_SAFE" ]; then
+		eir="$EIR_MIN_SAFE"
+	fi
+	if [ "$eir" -gt "$EIR_MAX" ]; then
+		echo "error: requested rate too high (EIR=$eir > $EIR_MAX)" >&2
+		return 1
+	fi
+
+	echo "$eir"
+}
+
+burst_bytes_to_ebs() {
+	local burst_bytes="$1"
+	local ebs
+
+	require_uinteger burst_bytes "$burst_bytes" || return 1
+	if [ "$burst_bytes" -eq 0 ]; then
+		echo "error: burst_bytes must be > 0" >&2
+		return 1
+	fi
+
+	ebs=$(( (burst_bytes + EBS_UNIT - 1) / EBS_UNIT ))
+	if [ "$ebs" -gt "$EBS_MAX" ]; then
+		echo "error: requested burst too high (EBS=$ebs > $EBS_MAX)" >&2
+		return 1
+	fi
+
+	echo "$ebs"
+}
+
 show_status() {
 	if ! ensure_debugfs; then
 		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
 		return 1
 	fi
 
-	echo tbf >"$YT_CMD"
-	cat "$YT_CMD"
+	run_cmd "tbf"
+}
+
+show_status_port() {
+	local port="$1"
+
+	require_port "$port" || return 1
+	run_cmd "tbf $port"
+}
+
+disable_port() {
+	local port="$1"
+
+	if ! ensure_debugfs; then
+		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
+		return 1
+	fi
+
+	require_port "$port" || return 1
+
+	run_cmd "field set 0xe9 $port 0 0" >/dev/null
+	run_cmd "field set 0xe9 $port 5 0" >/dev/null
+	run_cmd "field set 0xe9 $port 6 0" >/dev/null
+	show_status_port "$port"
+}
+
+set_port() {
+	local port="$1"
+	local rate_kbps="$2"
+	local burst_bytes="${3:-$DEFAULT_BURST_BYTES}"
+	local eir
+	local ebs
+
+	if ! ensure_debugfs; then
+		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
+		return 1
+	fi
+
+	require_port "$port" || return 1
+	eir="$(rate_kbps_to_eir "$rate_kbps")" || return 1
+	ebs="$(burst_bytes_to_ebs "$burst_bytes")" || return 1
+
+	run_cmd "field set 0xe9 $port 0 0" >/dev/null
+	run_cmd "field set 0xe9 $port 1 0" >/dev/null
+	run_cmd "field set 0xe9 $port 4 0" >/dev/null
+	run_cmd "field set 0xe9 $port 5 $ebs" >/dev/null
+	run_cmd "field set 0xe9 $port 6 $eir" >/dev/null
+	run_cmd "field set 0xe9 $port 0 1" >/dev/null
+
+	show_status_port "$port"
 }
 
 usage() {
@@ -32,7 +176,10 @@ usage() {
 Usage: cr881x-yt921x-qos <command>
 
 Commands:
-  status    Dump YT921x TBF status from debugfs
+  status                         Dump TBF status for all ports
+  status-port <port>             Dump TBF status for one port
+  set-port <port> <kbps> [burst] Set shaper on one port
+  disable-port <port>            Disable shaper on one port
 EOF
 }
 
@@ -41,6 +188,18 @@ case "$cmd" in
 status)
 	shift || true
 	show_status "$@"
+	;;
+status-port)
+	shift || true
+	show_status_port "${1:-}"
+	;;
+set-port)
+	shift || true
+	set_port "${1:-}" "${2:-}" "${3:-$DEFAULT_BURST_BYTES}"
+	;;
+disable-port)
+	shift || true
+	disable_port "${1:-}"
 	;;
 help|-h|--help)
 	usage

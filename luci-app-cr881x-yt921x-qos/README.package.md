@@ -1,10 +1,11 @@
 # luci-app-cr881x-yt921x-qos
 
-Hardware QoS status page for CR881x + YT921x.
+Hardware QoS status and runtime control page for CR881x + YT921x.
 
 ## Features
 - Reads YT921x TBF status from debugfs
-- Exposes status via rpcd/ubus (`luci.cr881x_yt921x_qos`)
+- Applies runtime per-port TBF settings via debugfs
+- Exposes status and controls via rpcd/ubus (`luci.cr881x_yt921x_qos`)
 - LuCI view under `Network` menu
 
 ## Buildroot usage

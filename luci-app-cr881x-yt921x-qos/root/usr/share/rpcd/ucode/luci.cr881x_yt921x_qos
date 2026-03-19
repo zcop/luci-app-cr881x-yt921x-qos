@@ -5,6 +5,8 @@
 import { access, popen } from 'fs';
 
 const helper = '/usr/sbin/cr881x-yt921x-qos';
+const port_max = 4;
+const default_burst_bytes = 65536;
 
 function shell_quote(s) {
 	if (s == null || s == '')
@@ -123,6 +125,74 @@ function status_call() {
 	};
 }
 
+function parse_nonneg_int(v, fallback) {
+	if (v == null || v == '')
+		return fallback;
+
+	const n = +v;
+	if (!(n >= 0))
+		return null;
+
+	return int(n);
+}
+
+function set_port_call(args) {
+	if (!access(helper, 'x')) {
+		return {
+			ok: false,
+			code: 127,
+			error: `${helper} is missing`
+		};
+	}
+
+	const port = parse_nonneg_int(args?.port, null);
+	const enable = parse_nonneg_int(args?.enable, 1);
+	const rate_kbps = parse_nonneg_int(args?.rate_kbps, 0);
+	const burst_bytes = parse_nonneg_int(args?.burst_bytes, default_burst_bytes);
+
+	if (port == null || port > port_max) {
+		return {
+			ok: false,
+			code: -22,
+			error: `invalid port (0..${port_max})`
+		};
+	}
+
+	if (enable && rate_kbps <= 0) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'rate_kbps must be > 0 when enabled'
+		};
+	}
+
+	if (enable && burst_bytes <= 0) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'burst_bytes must be > 0 when enabled'
+		};
+	}
+
+	const cmd = (!enable || rate_kbps <= 0) ? 'disable-port' : 'set-port';
+	const cmd_args = [ cmd, `${port}` ];
+	if (cmd == 'set-port') {
+		cmd_args[length(cmd_args)] = `${rate_kbps}`;
+		cmd_args[length(cmd_args)] = `${burst_bytes}`;
+	}
+
+	const res = run_helper(cmd_args);
+	const st = status_call();
+
+	return {
+		ok: (res.code == 0),
+		code: res.code,
+		error: (res.code == 0) ? '' : (res.output || 'set_port failed'),
+		output: res.output,
+		status: st
+	};
+}
+
 const methods = {
 	get_info: {
 		call: function() {
@@ -135,6 +205,18 @@ const methods = {
 	status: {
 		call: function() {
 			return status_call();
+		}
+	},
+
+	set_port: {
+		args: {
+			port: 'port',
+			enable: 'enable',
+			rate_kbps: 'rate_kbps',
+			burst_bytes: 'burst_bytes'
+		},
+		call: function(req) {
+			return set_port_call(req?.args || {});
 		}
 	}
 };
