@@ -15,6 +15,11 @@ EBS_UNIT=64
 EBS_MAX=16383
 DEFAULT_BURST_BYTES=65536
 
+PSCH_SHP_EBS_EIR_BASE=$((0x354000))
+PSCH_SHP_CTRL_BASE=$((0x354004))
+PSCH_SHP_STRIDE=8
+PSCH_SHP_EN=$((1 << 4))
+
 ensure_debugfs() {
 	if [ ! -d /sys/kernel/debug ]; then
 		return 1
@@ -131,6 +136,8 @@ show_status_port() {
 
 disable_port() {
 	local port="$1"
+	local reg_ctrl
+	local reg_ebs_eir
 
 	if ! ensure_debugfs; then
 		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
@@ -138,10 +145,11 @@ disable_port() {
 	fi
 
 	require_port "$port" || return 1
+	reg_ebs_eir=$((PSCH_SHP_EBS_EIR_BASE + PSCH_SHP_STRIDE * port))
+	reg_ctrl=$((PSCH_SHP_CTRL_BASE + PSCH_SHP_STRIDE * port))
 
-	run_cmd "field set 0xe9 $port 0 0" >/dev/null
-	run_cmd "field set 0xe9 $port 5 0" >/dev/null
-	run_cmd "field set 0xe9 $port 6 0" >/dev/null
+	run_cmd "reg write $reg_ctrl 0x0" >/dev/null
+	run_cmd "reg write $reg_ebs_eir 0x0" >/dev/null
 	show_status_port "$port"
 }
 
@@ -151,6 +159,9 @@ set_port() {
 	local burst_bytes="${3:-$DEFAULT_BURST_BYTES}"
 	local eir
 	local ebs
+	local reg_ctrl
+	local reg_ebs_eir
+	local val_ebs_eir
 
 	if ! ensure_debugfs; then
 		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
@@ -160,13 +171,13 @@ set_port() {
 	require_port "$port" || return 1
 	eir="$(rate_kbps_to_eir "$rate_kbps")" || return 1
 	ebs="$(burst_bytes_to_ebs "$burst_bytes")" || return 1
+	reg_ebs_eir=$((PSCH_SHP_EBS_EIR_BASE + PSCH_SHP_STRIDE * port))
+	reg_ctrl=$((PSCH_SHP_CTRL_BASE + PSCH_SHP_STRIDE * port))
+	val_ebs_eir=$(( (ebs << 18) | eir ))
 
-	run_cmd "field set 0xe9 $port 0 0" >/dev/null
-	run_cmd "field set 0xe9 $port 1 0" >/dev/null
-	run_cmd "field set 0xe9 $port 4 0" >/dev/null
-	run_cmd "field set 0xe9 $port 5 $ebs" >/dev/null
-	run_cmd "field set 0xe9 $port 6 $eir" >/dev/null
-	run_cmd "field set 0xe9 $port 0 1" >/dev/null
+	run_cmd "reg write $reg_ctrl 0x0" >/dev/null
+	run_cmd "reg write $reg_ebs_eir $val_ebs_eir" >/dev/null
+	run_cmd "reg write $reg_ctrl $PSCH_SHP_EN" >/dev/null
 
 	show_status_port "$port"
 }
