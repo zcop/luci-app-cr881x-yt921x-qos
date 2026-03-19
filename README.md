@@ -1,13 +1,10 @@
-# luci-app-cr881x-yt921x-qos
+# openwrt-app feed: luci-app-cr881x-yt921x-qos
 
-Hardware QoS status page for CR881x + YT921x.
+This repository is an OpenWrt feed containing:
+- `luci-app-cr881x-yt921x-qos/`
 
-## Features
-- Reads YT921x TBF status from debugfs
-- Exposes status via rpcd/ubus (`luci.cr881x_yt921x_qos`)
-- LuCI view under `Network` menu
+Feed entry example:
 
-## Buildroot usage
-- Place this directory under an OpenWrt feed
-- `./scripts/feeds update <feed>`
-- `./scripts/feeds install luci-app-cr881x-yt921x-qos`
+```text
+src-git zcopapp https://github.com/zcop/luci-app-cr881x-yt921x-qos.git
+```
