@@ -59,12 +59,12 @@ run_cmd() {
 	local cmd="$1"
 	local out
 
-	printf '%s\n' "$cmd" >"$YT_CMD"
+	echo "$cmd" >"$YT_CMD"
 	out="$(cat "$YT_CMD" 2>/dev/null || true)"
 	printf '%s\n' "$out"
 
 	case "$out" in
-	err=*|*"\nerr="*)
+	err=*|*err=*)
 		return 1
 		;;
 	esac
