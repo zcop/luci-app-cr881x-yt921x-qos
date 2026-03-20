@@ -20,6 +20,11 @@ PSCH_SHP_CTRL_BASE=$((0x354004))
 PSCH_SHP_STRIDE=8
 PSCH_SHP_EN=$((1 << 4))
 
+FILTER_MCAST_REG=$((0x180510))
+FILTER_BCAST_REG=$((0x180514))
+FILTER_MASK_MAX=$((0x7ff))
+FILTER_MASK_DANGEROUS=$((0x7ff))
+
 ensure_debugfs() {
 	if [ ! -d /sys/kernel/debug ]; then
 		return 1
@@ -60,6 +65,39 @@ require_port() {
 	return 0
 }
 
+parse_u11_mask() {
+	local name="$1"
+	local value="$2"
+	local parsed
+
+	if ! printf '%s\n' "$value" | grep -Eq '^(0[xX][0-9a-fA-F]+|[0-9]+)$'; then
+		echo "error: invalid $name '$value' (must be hex or decimal)" >&2
+		return 1
+	fi
+
+	parsed=$((value))
+	if [ "$parsed" -lt 0 ] || [ "$parsed" -gt "$FILTER_MASK_MAX" ]; then
+		echo "error: $name out of range (0..0x7ff): $value" >&2
+		return 1
+	fi
+
+	echo "$parsed"
+}
+
+is_force_token() {
+	case "${1:-}" in
+	--force|force|1|true|yes|on)
+		return 0
+		;;
+	esac
+
+	return 1
+}
+
+format_hex11() {
+	printf '0x%03x' "$1"
+}
+
 run_cmd() {
 	local cmd="$1"
 	local out
@@ -75,6 +113,21 @@ run_cmd() {
 	esac
 
 	return 0
+}
+
+read_reg_u32() {
+	local reg="$1"
+	local out
+	local val_hex
+
+	out="$(run_cmd "reg read $reg")" || return 1
+	val_hex="$(printf '%s\n' "$out" | grep -Eo '0x[0-9a-fA-F]+' | tail -n1 || true)"
+	if [ -z "$val_hex" ]; then
+		echo "error: failed to parse register read output for $reg: $out" >&2
+		return 1
+	fi
+
+	echo "$((val_hex))"
 }
 
 rate_kbps_to_eir() {
@@ -182,6 +235,60 @@ set_port() {
 	show_status_port "$port"
 }
 
+get_flood_filter() {
+	local mcast
+	local bcast
+
+	if ! ensure_debugfs; then
+		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
+		return 1
+	fi
+
+	mcast="$(read_reg_u32 "$FILTER_MCAST_REG")" || return 1
+	bcast="$(read_reg_u32 "$FILTER_BCAST_REG")" || return 1
+
+	printf 'mcast=%s\n' "$(format_hex11 "$((mcast & FILTER_MASK_MAX))")"
+	printf 'bcast=%s\n' "$(format_hex11 "$((bcast & FILTER_MASK_MAX))")"
+}
+
+set_flood_filter() {
+	local target="$1"
+	local mask_raw="$2"
+	local force_token="${3:-}"
+	local mask
+
+	if ! ensure_debugfs; then
+		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
+		return 1
+	fi
+
+	mask="$(parse_u11_mask mask "$mask_raw")" || return 1
+
+	if [ "$mask" -eq "$FILTER_MASK_DANGEROUS" ] && ! is_force_token "$force_token"; then
+		echo "error: refusing mask 0x7ff (full drop). pass --force to override." >&2
+		return 1
+	fi
+
+	case "$target" in
+	mcast)
+		run_cmd "reg write $FILTER_MCAST_REG $mask" >/dev/null
+		;;
+	bcast)
+		run_cmd "reg write $FILTER_BCAST_REG $mask" >/dev/null
+		;;
+	both)
+		run_cmd "reg write $FILTER_MCAST_REG $mask" >/dev/null
+		run_cmd "reg write $FILTER_BCAST_REG $mask" >/dev/null
+		;;
+	*)
+		echo "error: invalid target '$target' (expected mcast|bcast|both)" >&2
+		return 1
+		;;
+	esac
+
+	get_flood_filter
+}
+
 usage() {
 	cat <<'EOF'
 Usage: cr881x-yt921x-qos <command>
@@ -191,6 +298,9 @@ Commands:
   status-port <port>             Dump TBF status for one port
   set-port <port> <kbps> [burst] Set shaper on one port
   disable-port <port>            Disable shaper on one port
+  get-flood-filter               Show mcast/bcast egress drop masks
+  set-flood-filter <target> <mask> [--force]
+                                 Set mcast/bcast/both filter mask (0..0x7ff)
 EOF
 }
 
@@ -211,6 +321,14 @@ set-port)
 disable-port)
 	shift || true
 	disable_port "${1:-}"
+	;;
+get-flood-filter)
+	shift || true
+	get_flood_filter "$@"
+	;;
+set-flood-filter)
+	shift || true
+	set_flood_filter "${1:-}" "${2:-}" "${3:-}"
 	;;
 help|-h|--help)
 	usage

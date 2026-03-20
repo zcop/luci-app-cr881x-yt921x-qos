@@ -7,6 +7,7 @@ import { access, popen } from 'fs';
 const helper = '/usr/sbin/cr881x-yt921x-qos';
 const port_max = 4;
 const default_burst_bytes = 65536;
+const filter_mask_max = 0x7ff;
 
 function shell_quote(s) {
 	if (s == null || s == '')
@@ -136,6 +137,57 @@ function parse_nonneg_int(v, fallback) {
 	return int(n);
 }
 
+function parse_flood_output(output) {
+	let mcast = null;
+	let bcast = null;
+	let lines = split(output || '', '\n');
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = trim(lines[i]);
+		let eq = index(line, '=');
+		if (eq <= 0)
+			continue;
+
+		let key = trim(substr(line, 0, eq));
+		let val = trim(substr(line, eq + 1));
+		let parsed = +val;
+		if (!(parsed >= 0))
+			continue;
+
+		if (key == 'mcast')
+			mcast = int(parsed) & filter_mask_max;
+		else if (key == 'bcast')
+			bcast = int(parsed) & filter_mask_max;
+	}
+
+	return {
+		mcast,
+		bcast
+	};
+}
+
+function flood_filter_call() {
+	if (!access(helper, 'x')) {
+		return {
+			ok: false,
+			code: 127,
+			error: `${helper} is missing`
+		};
+	}
+
+	const res = run_helper([ 'get-flood-filter' ]);
+	const parsed = parse_flood_output(res.output);
+
+	return {
+		ok: (res.code == 0),
+		code: res.code,
+		error: (res.code == 0) ? '' : (res.output || 'get_flood_filter failed'),
+		output: res.output,
+		mcast: parsed.mcast,
+		bcast: parsed.bcast
+	};
+}
+
 function set_port_call(args) {
 	if (!access(helper, 'x')) {
 		return {
@@ -193,6 +245,51 @@ function set_port_call(args) {
 	};
 }
 
+function set_flood_filter_call(args) {
+	if (!access(helper, 'x')) {
+		return {
+			ok: false,
+			code: 127,
+			error: `${helper} is missing`
+		};
+	}
+
+	const target = trim(`${args?.target || ''}`);
+	const mask = trim(`${args?.mask || ''}`);
+	const force = parse_nonneg_int(args?.force, 0);
+
+	if (target != 'mcast' && target != 'bcast' && target != 'both') {
+		return {
+			ok: false,
+			code: -22,
+			error: 'invalid target (mcast|bcast|both)'
+		};
+	}
+
+	if (!mask) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'mask is required'
+		};
+	}
+
+	const cmd_args = [ 'set-flood-filter', target, mask ];
+	if (force)
+		cmd_args[length(cmd_args)] = '--force';
+
+	const res = run_helper(cmd_args);
+	const st = flood_filter_call();
+
+	return {
+		ok: (res.code == 0),
+		code: res.code,
+		error: (res.code == 0) ? '' : (res.output || 'set_flood_filter failed'),
+		output: res.output,
+		status: st
+	};
+}
+
 const methods = {
 	get_info: {
 		call: function() {
@@ -208,6 +305,12 @@ const methods = {
 		}
 	},
 
+	get_flood_filter: {
+		call: function() {
+			return flood_filter_call();
+		}
+	},
+
 	set_port: {
 		args: {
 			port: 'port',
@@ -217,6 +320,17 @@ const methods = {
 		},
 		call: function(req) {
 			return set_port_call(req?.args || {});
+		}
+	},
+
+	set_flood_filter: {
+		args: {
+			target: 'target',
+			mask: 'mask',
+			force: 'force'
+		},
+		call: function(req) {
+			return set_flood_filter_call(req?.args || {});
 		}
 	}
 };

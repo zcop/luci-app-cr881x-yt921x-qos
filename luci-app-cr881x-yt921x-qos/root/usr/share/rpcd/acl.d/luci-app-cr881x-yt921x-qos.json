@@ -3,12 +3,12 @@
 		"description": "Grant read/write access to CR881x YT921x QoS status and controls",
 		"read": {
 			"ubus": {
-				"luci.cr881x_yt921x_qos": [ "status", "get_info" ]
+				"luci.cr881x_yt921x_qos": [ "status", "get_info", "get_flood_filter" ]
 			}
 		},
 		"write": {
 			"ubus": {
-				"luci.cr881x_yt921x_qos": [ "set_port" ]
+				"luci.cr881x_yt921x_qos": [ "set_port", "set_flood_filter" ]
 			}
 		}
 	}

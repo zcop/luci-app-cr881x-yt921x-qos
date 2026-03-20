@@ -5,6 +5,9 @@
 
 const NUM_PORTS = 5;
 const DEFAULT_BURST_BYTES = 65536;
+const FILTER_MASK_MAX = 0x7ff;
+const FILTER_MASK_DANGEROUS = 0x7ff;
+const FILTER_SAFE_DEFAULT = 0x400;
 
 const callInfo = rpc.declare({
 	object: 'luci.cr881x_yt921x_qos',
@@ -25,6 +28,19 @@ const callSetPort = rpc.declare({
 	expect: {}
 });
 
+const callGetFloodFilter = rpc.declare({
+	object: 'luci.cr881x_yt921x_qos',
+	method: 'get_flood_filter',
+	expect: {}
+});
+
+const callSetFloodFilter = rpc.declare({
+	object: 'luci.cr881x_yt921x_qos',
+	method: 'set_flood_filter',
+	params: [ 'target', 'mask', 'force' ],
+	expect: {}
+});
+
 function fmt_num(v) {
 	if (v == null)
 		return '-';
@@ -38,6 +54,31 @@ function fmt_bool(v) {
 function parse_int(v, fallback) {
 	const n = parseInt(v, 10);
 	return Number.isFinite(n) ? n : fallback;
+}
+
+function parse_mask_input(v) {
+	const s = String(v == null ? '' : v).trim();
+	let n = NaN;
+
+	if (/^0x[0-9a-f]+$/i.test(s))
+		n = parseInt(s, 16);
+	else if (/^[0-9]+$/.test(s))
+		n = parseInt(s, 10);
+
+	if (!Number.isInteger(n) || n < 0 || n > FILTER_MASK_MAX)
+		return null;
+
+	return n;
+}
+
+function fmt_mask_hex(v) {
+	if (v == null || v < 0)
+		return '-';
+
+	let s = Number(v).toString(16);
+	while (s.length < 3)
+		s = '0' + s;
+	return '0x' + s;
 }
 
 function status_map_by_port(ports) {
@@ -163,13 +204,15 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			L.resolveDefault(callInfo(), {}),
-			L.resolveDefault(callStatus(), {})
+			L.resolveDefault(callStatus(), {}),
+			L.resolveDefault(callGetFloodFilter(), {})
 		]);
 	},
 
 	render: function(data) {
 		const info = data[0] || {};
 		const st = data[1] || {};
+		const flood = data[2] || {};
 
 		const rawBox = E('textarea', {
 			'class': 'cbi-input-textarea',
@@ -214,6 +257,32 @@ return view.extend({
 			type: 'button'
 		}, [ _('Refresh') ]);
 
+		const floodTarget = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { value: 'both' }, [ _('Both (mcast+bcast)') ]),
+			E('option', { value: 'mcast' }, [ _('Multicast only') ]),
+			E('option', { value: 'bcast' }, [ _('Broadcast only') ])
+		]);
+
+		const floodMaskInput = E('input', {
+			'class': 'cbi-input-text',
+			type: 'text',
+			style: 'width: 10em;',
+			placeholder: '0x400'
+		});
+		floodMaskInput.value = fmt_mask_hex(FILTER_SAFE_DEFAULT);
+
+		const floodForce = E('input', {
+			type: 'checkbox'
+		});
+
+		const floodApplyBtn = E('button', {
+			'class': 'cbi-button cbi-button-apply',
+			type: 'button'
+		}, [ _('Apply filter mask') ]);
+
+		const floodMcastNow = E('code', {}, [ '-' ]);
+		const floodBcastNow = E('code', {}, [ '-' ]);
+
 		const helperPath = E('code', {}, [ info.helper || '/usr/sbin/cr881x-yt921x-qos' ]);
 
 		const applyState = function(next) {
@@ -222,15 +291,36 @@ return view.extend({
 			update_raw_box(rawBox, next || {});
 		};
 
+		const applyFloodState = function(next) {
+			const mcast = (next && next.mcast != null) ? +next.mcast : null;
+			const bcast = (next && next.bcast != null) ? +next.bcast : null;
+
+			floodMcastNow.textContent = (mcast == null) ? '-' : (fmt_mask_hex(mcast) + ' (' + mcast + ')');
+			floodBcastNow.textContent = (bcast == null) ? '-' : (fmt_mask_hex(bcast) + ' (' + bcast + ')');
+		};
+
 		const refreshState = function() {
-			return L.resolveDefault(callStatus(), {}).then(function(next) {
-				if (!next || !next.ok) {
+			return Promise.all([
+				L.resolveDefault(callStatus(), {}),
+				L.resolveDefault(callGetFloodFilter(), {})
+			]).then(function(next) {
+				const nextStatus = next[0] || {};
+				const nextFlood = next[1] || {};
+
+				if (!nextStatus || !nextStatus.ok) {
 					ui.addNotification(null,
-						E('p', {}, [ (next && (next.error || next.output)) || _('Failed to refresh QoS status.') ]),
+						E('p', {}, [ (nextStatus && (nextStatus.error || nextStatus.output)) || _('Failed to refresh QoS status.') ]),
 						'error');
 				}
 
-				applyState(next || {});
+				if (!nextFlood || !nextFlood.ok) {
+					ui.addNotification(null,
+						E('p', {}, [ (nextFlood && (nextFlood.error || nextFlood.output)) || _('Failed to refresh flood filter state.') ]),
+						'error');
+				}
+
+				applyState(nextStatus || {});
+				applyFloodState(nextFlood || {});
 			});
 		};
 
@@ -249,11 +339,54 @@ return view.extend({
 			});
 		};
 
+		const applyFlood = function(target, mask, force) {
+			return L.resolveDefault(callSetFloodFilter(target, mask, force), {}).then(function(res) {
+				if (!res || !res.ok) {
+					ui.addNotification(null,
+						E('p', {}, [ (res && (res.error || res.output)) || _('Failed to apply flood filter.') ]),
+						'error');
+				}
+
+				if (res && res.status)
+					applyFloodState(res.status);
+				else
+					return refreshState();
+			});
+		};
+
 		applyState(st);
+		applyFloodState(flood);
 
 		refreshBtn.addEventListener('click', function(ev) {
 			ev.preventDefault();
 			refreshState();
+		});
+
+		floodApplyBtn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+
+			const parsedMask = parse_mask_input(floodMaskInput.value);
+			const force = floodForce.checked ? 1 : 0;
+			const target = floodTarget.value || 'both';
+
+			if (parsedMask == null) {
+				ui.addNotification(null,
+					E('p', {}, [ _('Mask must be decimal or hex in range 0..0x7ff') ]),
+					'error');
+				return;
+			}
+
+			if (parsedMask === FILTER_MASK_DANGEROUS && !force) {
+				ui.addNotification(null,
+					E('p', {}, [ _('0x7ff drops all egress flood traffic. Check force to apply.') ]),
+					'error');
+				return;
+			}
+
+			floodApplyBtn.disabled = true;
+			Promise.resolve(applyFlood(target, fmt_mask_hex(parsedMask), force)).finally(function() {
+				floodApplyBtn.disabled = false;
+			});
 		});
 
 		return E('div', {}, [
@@ -269,6 +402,27 @@ return view.extend({
 				]),
 				E('div', { 'class': 'cbi-section' }, [
 					controlTable,
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ _('Flood filter state') ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							_('MCAST: '), floodMcastNow, ' ',
+							_('BCAST: '), floodBcastNow
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, [ _('Flood filter control') ]),
+						E('div', { 'class': 'cbi-value-field' }, [
+							floodTarget, ' ',
+							floodMaskInput, ' ',
+							E('label', { 'style': 'margin-right: 0.75em;' }, [ floodForce, ' ', _('force 0x7ff') ]), ' ',
+							floodApplyBtn
+						])
+					]),
+					E('div', { 'class': 'cbi-section-descr' }, [
+						_('Default safe mask is 0x400 (drop to internal MCU only).'),
+						' ',
+						_('Using 0x7ff can blackhole ARP/ND and break LAN reachability.')
+					]),
 					E('hr'),
 					statusTable,
 					E('div', { 'class': 'cbi-value' }, [
