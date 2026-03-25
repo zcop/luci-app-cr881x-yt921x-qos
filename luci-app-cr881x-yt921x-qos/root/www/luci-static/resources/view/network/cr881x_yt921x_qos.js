@@ -3,12 +3,29 @@
 'require rpc';
 'require ui';
 
-const NUM_PORTS = 5;
+const NUM_PORTS = 4;
 const DEFAULT_BURST_BYTES = 65536;
 const FILTER_MASK_MAX = 0x7ff;
 const FILTER_MASK_DANGEROUS = 0x7ff;
 const FILTER_SAFE_DEFAULT = 0x400;
 const STYLE_ID = 'cr881x-yt921x-qos-style';
+
+function port_label(port) {
+	switch (port) {
+	case 0:
+		return _('LAN 1');
+	case 1:
+		return _('LAN 2');
+	case 2:
+		return _('LAN 3');
+	case 3:
+		return _('WAN');
+	case 4:
+		return _('Internal (CPU/MCU)');
+	default:
+		return _('Port ') + port;
+	}
+}
 
 const callInfo = rpc.declare({
 	object: 'luci.cr881x_yt921x_qos',
@@ -343,7 +360,7 @@ function status_map_by_port(ports) {
 
 	for (let i = 0; i < ports.length; i++) {
 		const p = ports[i];
-		if (p && p.port != null)
+		if (p && p.port != null && +p.port < NUM_PORTS)
 			map[+p.port] = p;
 	}
 
@@ -461,7 +478,7 @@ function port_card(port, st, apply_cb) {
 
 	return E('div', { class: 'crq-port-card' }, [
 		E('div', { class: 'crq-port-header' }, [
-			E('div', { class: 'crq-port-name' }, [ 'p' + port ]),
+			E('div', { class: 'crq-port-name' }, [ port_label(port) ]),
 			chip
 		]),
 		E('div', { class: 'crq-port-live' }, [
@@ -580,7 +597,7 @@ return view.extend({
 			let activeRates = [];
 
 			for (let i = 0; i < ports.length; i++) {
-				if (+ports[i].en) {
+				if (ports[i] && +ports[i].port < NUM_PORTS && +ports[i].en) {
 					enabledCount++;
 					activeRates.push(Math.round(+ports[i].rate_kbps || 0));
 				}
