@@ -2,8 +2,8 @@
 
 set -eu
 
-YT_CMD="/sys/kernel/debug/yt921x_cmd"
-PORT_MAX=4
+PORT_MAX=3
+DEFAULT_BURST_BYTES=65536
 
 RATE_SCALE_NUM=1535
 RATE_SCALE_DEN=1000
@@ -13,31 +13,9 @@ EIR_MAX=262143
 
 EBS_UNIT=64
 EBS_MAX=16383
-DEFAULT_BURST_BYTES=65536
 
-PSCH_SHP_EBS_EIR_BASE=$((0x354000))
-PSCH_SHP_CTRL_BASE=$((0x354004))
-PSCH_SHP_STRIDE=8
-PSCH_SHP_EN=$((1 << 4))
-
-FILTER_MCAST_REG=$((0x180510))
-FILTER_BCAST_REG=$((0x180514))
-FILTER_MASK_MAX=$((0x7ff))
-FILTER_MASK_DANGEROUS=$((0x7ff))
-
-ensure_debugfs() {
-	if [ ! -d /sys/kernel/debug ]; then
-		return 1
-	fi
-
-	if [ ! -e "$YT_CMD" ]; then
-		if ! mountpoint -q /sys/kernel/debug 2>/dev/null; then
-			mount -t debugfs debugfs /sys/kernel/debug >/dev/null 2>&1 || true
-		fi
-	fi
-
-	[ -w "$YT_CMD" ] && [ -r "$YT_CMD" ]
-}
+CFG_PKG="cr881x_yt921x_qos"
+CFG_FILE="/etc/config/${CFG_PKG}"
 
 require_uinteger() {
 	local name="$1"
@@ -65,69 +43,77 @@ require_port() {
 	return 0
 }
 
-parse_u11_mask() {
-	local name="$1"
-	local value="$2"
-	local parsed
-
-	if ! printf '%s\n' "$value" | grep -Eq '^(0[xX][0-9a-fA-F]+|[0-9]+)$'; then
-		echo "error: invalid $name '$value' (must be hex or decimal)" >&2
-		return 1
-	fi
-
-	parsed=$((value))
-	if [ "$parsed" -lt 0 ] || [ "$parsed" -gt "$FILTER_MASK_MAX" ]; then
-		echo "error: $name out of range (0..0x7ff): $value" >&2
-		return 1
-	fi
-
-	echo "$parsed"
-}
-
-is_force_token() {
-	case "${1:-}" in
-	--force|force|1|true|yes|on)
-		return 0
-		;;
-	esac
-
-	return 1
-}
-
-format_hex11() {
-	printf '0x%03x' "$1"
-}
-
-run_cmd() {
-	local cmd="$1"
-	local out
-
-	echo "$cmd" >"$YT_CMD"
-	out="$(cat "$YT_CMD" 2>/dev/null || true)"
-	printf '%s\n' "$out"
-
-	case "$out" in
-	err=*|*err=*)
+port_iface() {
+	case "$1" in
+	0) echo "lan1" ;;
+	1) echo "lan2" ;;
+	2) echo "lan3" ;;
+	3) echo "wan" ;;
+	*)
+		echo "error: unsupported port '$1'" >&2
 		return 1
 		;;
 	esac
-
-	return 0
 }
 
-read_reg_u32() {
-	local reg="$1"
-	local out
-	local val_hex
-
-	out="$(run_cmd "reg read $reg")" || return 1
-	val_hex="$(printf '%s\n' "$out" | grep -Eo '0x[0-9a-fA-F]+' | tail -n1 || true)"
-	if [ -z "$val_hex" ]; then
-		echo "error: failed to parse register read output for $reg: $out" >&2
+ensure_tools() {
+	command -v tc >/dev/null 2>&1 || {
+		echo "error: tc command is missing (install ip-full)" >&2
 		return 1
-	fi
+	}
+	command -v uci >/dev/null 2>&1 || {
+		echo "error: uci command is missing" >&2
+		return 1
+	}
+}
 
-	echo "$((val_hex))"
+ensure_config() {
+	[ -f "$CFG_FILE" ] || return 0
+}
+
+ensure_port_section() {
+	local port="$1"
+	local sec="port${port}"
+
+	if ! uci -q get "${CFG_PKG}.${sec}" >/dev/null 2>&1; then
+		uci -q set "${CFG_PKG}.${sec}=port"
+		uci -q set "${CFG_PKG}.${sec}.port=${port}"
+		uci -q set "${CFG_PKG}.${sec}.enabled=0"
+		uci -q set "${CFG_PKG}.${sec}.rate_kbps=100000"
+		uci -q set "${CFG_PKG}.${sec}.burst_bytes=${DEFAULT_BURST_BYTES}"
+	fi
+}
+
+cfg_get_port_enabled() {
+	local port="$1"
+	uci -q get "${CFG_PKG}.port${port}.enabled" || echo "0"
+}
+
+cfg_get_port_rate() {
+	local port="$1"
+	uci -q get "${CFG_PKG}.port${port}.rate_kbps" || echo "100000"
+}
+
+cfg_get_port_burst() {
+	local port="$1"
+	uci -q get "${CFG_PKG}.port${port}.burst_bytes" || echo "$DEFAULT_BURST_BYTES"
+}
+
+cfg_set_port() {
+	local port="$1"
+	local enabled="$2"
+	local rate_kbps="$3"
+	local burst_bytes="$4"
+
+	ensure_port_section "$port"
+	uci -q set "${CFG_PKG}.port${port}.enabled=${enabled}"
+	uci -q set "${CFG_PKG}.port${port}.rate_kbps=${rate_kbps}"
+	uci -q set "${CFG_PKG}.port${port}.burst_bytes=${burst_bytes}"
+	uci -q commit "$CFG_PKG"
+}
+
+cfg_get_global_enabled() {
+	uci -q get "${CFG_PKG}.globals.enabled" || echo "1"
 }
 
 rate_kbps_to_eir() {
@@ -171,122 +157,157 @@ burst_bytes_to_ebs() {
 	echo "$ebs"
 }
 
-show_status() {
-	if ! ensure_debugfs; then
-		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
-		return 1
-	fi
+apply_port_runtime() {
+	local port="$1"
+	local enabled="$2"
+	local rate_kbps="$3"
+	local burst_bytes="$4"
+	local iface
 
-	run_cmd "tbf"
+	iface="$(port_iface "$port")"
+
+	if [ "$enabled" -eq 1 ]; then
+		tc qdisc replace dev "$iface" root tbf \
+			rate "${rate_kbps}kbit" \
+			burst "${burst_bytes}" \
+			latency 100ms >/dev/null
+	else
+		tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+	fi
 }
 
 show_status_port() {
 	local port="$1"
+	local enabled
+	local rate_kbps
+	local burst_bytes
+	local eir
+	local ebs
 
 	require_port "$port" || return 1
-	run_cmd "tbf $port"
-}
+	enabled="$(cfg_get_port_enabled "$port")"
+	rate_kbps="$(cfg_get_port_rate "$port")"
+	burst_bytes="$(cfg_get_port_burst "$port")"
 
-disable_port() {
-	local port="$1"
-	local reg_ctrl
-	local reg_ebs_eir
-
-	if ! ensure_debugfs; then
-		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
-		return 1
+	if ! require_uinteger enabled "$enabled"; then
+		enabled=0
+	fi
+	if ! require_uinteger rate_kbps "$rate_kbps"; then
+		rate_kbps=0
+	fi
+	if ! require_uinteger burst_bytes "$burst_bytes"; then
+		burst_bytes="$DEFAULT_BURST_BYTES"
 	fi
 
-	require_port "$port" || return 1
-	reg_ebs_eir=$((PSCH_SHP_EBS_EIR_BASE + PSCH_SHP_STRIDE * port))
-	reg_ctrl=$((PSCH_SHP_CTRL_BASE + PSCH_SHP_STRIDE * port))
+	if [ "$enabled" -eq 1 ]; then
+		eir="$(rate_kbps_to_eir "$rate_kbps" 2>/dev/null || echo 0)"
+		ebs="$(burst_bytes_to_ebs "$burst_bytes" 2>/dev/null || echo 0)"
+	else
+		eir=0
+		ebs=0
+		rate_kbps=0
+		burst_bytes=0
+	fi
 
-	run_cmd "reg write $reg_ctrl 0x0" >/dev/null
-	run_cmd "reg write $reg_ebs_eir 0x0" >/dev/null
-	show_status_port "$port"
+	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} (~${rate_kbps} kbps) ebs=${ebs} (~${burst_bytes} bytes)"
+}
+
+show_status() {
+	local port
+
+	ensure_tools || return 1
+	ensure_config
+	for port in 0 1 2 3; do
+		show_status_port "$port"
+	done
 }
 
 set_port() {
 	local port="$1"
 	local rate_kbps="$2"
 	local burst_bytes="${3:-$DEFAULT_BURST_BYTES}"
-	local eir
-	local ebs
-	local reg_ctrl
-	local reg_ebs_eir
-	local val_ebs_eir
 
-	if ! ensure_debugfs; then
-		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
-		return 1
-	fi
-
+	ensure_tools || return 1
+	ensure_config
 	require_port "$port" || return 1
-	eir="$(rate_kbps_to_eir "$rate_kbps")" || return 1
-	ebs="$(burst_bytes_to_ebs "$burst_bytes")" || return 1
-	reg_ebs_eir=$((PSCH_SHP_EBS_EIR_BASE + PSCH_SHP_STRIDE * port))
-	reg_ctrl=$((PSCH_SHP_CTRL_BASE + PSCH_SHP_STRIDE * port))
-	val_ebs_eir=$(( (ebs << 18) | eir ))
+	rate_kbps_to_eir "$rate_kbps" >/dev/null || return 1
+	burst_bytes_to_ebs "$burst_bytes" >/dev/null || return 1
 
-	run_cmd "reg write $reg_ctrl 0x0" >/dev/null
-	run_cmd "reg write $reg_ebs_eir $val_ebs_eir" >/dev/null
-	run_cmd "reg write $reg_ctrl $PSCH_SHP_EN" >/dev/null
-
+	apply_port_runtime "$port" 1 "$rate_kbps" "$burst_bytes"
+	cfg_set_port "$port" 1 "$rate_kbps" "$burst_bytes"
 	show_status_port "$port"
 }
 
-get_flood_filter() {
-	local mcast
-	local bcast
+disable_port() {
+	local port="$1"
+	local rate_kbps
+	local burst_bytes
 
-	if ! ensure_debugfs; then
-		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
-		return 1
+	ensure_tools || return 1
+	ensure_config
+	require_port "$port" || return 1
+
+	rate_kbps="$(cfg_get_port_rate "$port")"
+	burst_bytes="$(cfg_get_port_burst "$port")"
+	if ! require_uinteger rate_kbps "$rate_kbps"; then
+		rate_kbps=100000
+	fi
+	if ! require_uinteger burst_bytes "$burst_bytes"; then
+		burst_bytes="$DEFAULT_BURST_BYTES"
 	fi
 
-	mcast="$(read_reg_u32 "$FILTER_MCAST_REG")" || return 1
-	bcast="$(read_reg_u32 "$FILTER_BCAST_REG")" || return 1
+	apply_port_runtime "$port" 0 0 0
+	cfg_set_port "$port" 0 "$rate_kbps" "$burst_bytes"
+	show_status_port "$port"
+}
 
-	printf 'mcast=%s\n' "$(format_hex11 "$((mcast & FILTER_MASK_MAX))")"
-	printf 'bcast=%s\n' "$(format_hex11 "$((bcast & FILTER_MASK_MAX))")"
+apply_saved() {
+	local port
+	local enabled
+	local rate_kbps
+	local burst_bytes
+
+	ensure_tools || return 1
+	ensure_config
+
+	if [ "$(cfg_get_global_enabled)" = "0" ]; then
+		for port in 0 1 2 3; do
+			apply_port_runtime "$port" 0 0 0
+		done
+		return 0
+	fi
+
+	for port in 0 1 2 3; do
+		enabled="$(cfg_get_port_enabled "$port")"
+		rate_kbps="$(cfg_get_port_rate "$port")"
+		burst_bytes="$(cfg_get_port_burst "$port")"
+
+		if ! require_uinteger enabled "$enabled"; then
+			enabled=0
+		fi
+		if ! require_uinteger rate_kbps "$rate_kbps"; then
+			rate_kbps=100000
+		fi
+		if ! require_uinteger burst_bytes "$burst_bytes"; then
+			burst_bytes="$DEFAULT_BURST_BYTES"
+		fi
+
+		if [ "$enabled" -eq 1 ]; then
+			apply_port_runtime "$port" 1 "$rate_kbps" "$burst_bytes" || true
+		else
+			apply_port_runtime "$port" 0 0 0 || true
+		fi
+	done
+}
+
+get_flood_filter() {
+	echo "error: flood filter control is unavailable in release backend" >&2
+	return 1
 }
 
 set_flood_filter() {
-	local target="$1"
-	local mask_raw="$2"
-	local force_token="${3:-}"
-	local mask
-
-	if ! ensure_debugfs; then
-		echo "error: yt921x debugfs is not available (check CONFIG_NET_DSA_YT921X_DEBUGFS)"
-		return 1
-	fi
-
-	mask="$(parse_u11_mask mask "$mask_raw")" || return 1
-
-	if [ "$mask" -eq "$FILTER_MASK_DANGEROUS" ] && ! is_force_token "$force_token"; then
-		echo "error: refusing mask 0x7ff (full drop). pass --force to override." >&2
-		return 1
-	fi
-
-	case "$target" in
-	mcast)
-		run_cmd "reg write $FILTER_MCAST_REG $mask" >/dev/null
-		;;
-	bcast)
-		run_cmd "reg write $FILTER_BCAST_REG $mask" >/dev/null
-		;;
-	both)
-		run_cmd "reg write $FILTER_MCAST_REG $mask" >/dev/null
-		run_cmd "reg write $FILTER_BCAST_REG $mask" >/dev/null
-		;;
-	*)
-		echo "error: invalid target '$target' (expected mcast|bcast|both)" >&2
-		return 1
-		;;
-	esac
-
-	get_flood_filter
+	echo "error: flood filter control is unavailable in release backend" >&2
+	return 1
 }
 
 usage() {
@@ -294,13 +315,13 @@ usage() {
 Usage: cr881x-yt921x-qos <command>
 
 Commands:
-  status                         Dump TBF status for all ports
-  status-port <port>             Dump TBF status for one port
-  set-port <port> <kbps> [burst] Set shaper on one port
-  disable-port <port>            Disable shaper on one port
-  get-flood-filter               Show mcast/bcast egress drop masks
-  set-flood-filter <target> <mask> [--force]
-                                 Set mcast/bcast/both filter mask (0..0x7ff)
+  status                         Dump QoS status for all ports
+  status-port <port>             Dump QoS status for one port
+  set-port <port> <kbps> [burst] Set persistent per-port TBF
+  disable-port <port>            Disable persistent per-port TBF
+  apply                          Apply saved UCI settings to tc
+  get-flood-filter               Unsupported in release backend
+  set-flood-filter               Unsupported in release backend
 EOF
 }
 
@@ -322,13 +343,17 @@ disable-port)
 	shift || true
 	disable_port "${1:-}"
 	;;
+apply)
+	shift || true
+	apply_saved "$@"
+	;;
 get-flood-filter)
 	shift || true
 	get_flood_filter "$@"
 	;;
 set-flood-filter)
 	shift || true
-	set_flood_filter "${1:-}" "${2:-}" "${3:-}"
+	set_flood_filter "$@"
 	;;
 help|-h|--help)
 	usage

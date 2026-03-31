@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+
+SERVICE_NAME="cr881x-yt921x-qos"
+HELPER="/usr/sbin/cr881x-yt921x-qos"
+
+start_service() {
+	[ -x "$HELPER" ] || return 0
+	"$HELPER" apply >/dev/null 2>&1 || logger -t "$SERVICE_NAME" "failed to apply saved QoS settings"
+}
+
+reload_service() {
+	start_service
+}

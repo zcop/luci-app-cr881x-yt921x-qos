@@ -1,13 +1,16 @@
-# luci-app-cr881x-yt921x-qos
+# `luci-app-cr881x-yt921x-qos`
 
-Hardware QoS status and runtime control page for CR881x + YT921x.
+Hardware QoS status and control page for CR881x + YT921x.
 
 ## Features
-- Reads YT921x TBF status from debugfs
-- Applies runtime per-port TBF settings via debugfs
-- Reads/writes YT921x flood egress drop masks (`0x180510`/`0x180514`) with `0x7ff` safety guard
+- Uses a release-safe backend (`tc` + UCI), no debugfs dependency
+- Applies per-port TBF on `lan1`, `lan2`, `lan3`, `wan`
+- Persists QoS settings in `/etc/config/cr881x_yt921x_qos`
+- Auto-applies saved QoS settings at boot via init script
 - Exposes status and controls via rpcd/ubus (`luci.cr881x_yt921x_qos`)
 - LuCI view under `Network` menu
+- Capability-aware UI:
+  - Flood filter controls are hidden/disabled when backend does not support them
 
 ## Buildroot usage
 - Place this directory under an OpenWrt feed

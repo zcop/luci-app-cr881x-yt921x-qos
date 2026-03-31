@@ -5,7 +5,7 @@
 import { access, popen } from 'fs';
 
 const helper = '/usr/sbin/cr881x-yt921x-qos';
-const port_max = 4;
+const port_max = 3;
 const default_burst_bytes = 65536;
 const filter_mask_max = 0x7ff;
 
@@ -167,6 +167,14 @@ function parse_flood_output(output) {
 }
 
 function flood_filter_call() {
+	if (!get_info_call().features.flood_filter) {
+		return {
+			ok: false,
+			code: -95,
+			error: 'flood filter control is unsupported by current backend'
+		};
+	}
+
 	if (!access(helper, 'x')) {
 		return {
 			ok: false,
@@ -185,6 +193,19 @@ function flood_filter_call() {
 		output: res.output,
 		mcast: parsed.mcast,
 		bcast: parsed.bcast
+	};
+}
+
+function get_info_call() {
+	return {
+		helper,
+		backend: 'tc',
+		port_max,
+		features: {
+			persistent: true,
+			port_tbf: true,
+			flood_filter: false
+		}
 	};
 }
 
@@ -246,6 +267,14 @@ function set_port_call(args) {
 }
 
 function set_flood_filter_call(args) {
+	if (!get_info_call().features.flood_filter) {
+		return {
+			ok: false,
+			code: -95,
+			error: 'flood filter control is unsupported by current backend'
+		};
+	}
+
 	if (!access(helper, 'x')) {
 		return {
 			ok: false,
@@ -293,9 +322,7 @@ function set_flood_filter_call(args) {
 const methods = {
 	get_info: {
 		call: function() {
-			return {
-				helper
-			};
+			return get_info_call();
 		}
 	},
 

@@ -352,15 +352,16 @@ function fmt_bytes_short(bytes) {
 	return n + ' B';
 }
 
-function status_map_by_port(ports) {
+function status_map_by_port(ports, max_ports) {
 	const map = {};
+	const limit = (max_ports == null) ? NUM_PORTS : max_ports;
 
 	if (!ports)
 		return map;
 
 	for (let i = 0; i < ports.length; i++) {
 		const p = ports[i];
-		if (p && p.port != null && +p.port < NUM_PORTS)
+		if (p && p.port != null && +p.port < limit)
 			map[+p.port] = p;
 	}
 
@@ -518,19 +519,28 @@ function port_card(port, st, apply_cb) {
 
 return view.extend({
 	load: function() {
-		return Promise.all([
-			L.resolveDefault(callInfo(), {}),
-			L.resolveDefault(callStatus(), {}),
-			L.resolveDefault(callGetFloodFilter(), {})
-		]);
+		return L.resolveDefault(callInfo(), {}).then(function(info) {
+			const flood = !!(info && info.features && info.features.flood_filter);
+
+			return Promise.all([
+				info || {},
+				L.resolveDefault(callStatus(), {}),
+				flood ? L.resolveDefault(callGetFloodFilter(), {}) : Promise.resolve({})
+			]);
+		});
 	},
 
 	render: function(data) {
 		ensure_style();
 
 		const info = data[0] || {};
+		const features = info.features || {};
+		const floodSupported = !!features.flood_filter;
+		const persistentSupported = !!features.persistent;
+		const portMax = parse_int(info.port_max, NUM_PORTS - 1);
+		const numPorts = Math.max(1, portMax + 1);
 		let currentStatus = data[1] || {};
-		let currentFlood = data[2] || {};
+		let currentFlood = floodSupported ? (data[2] || {}) : {};
 
 		const refreshBtn = E('button', {
 			type: 'button',
@@ -538,7 +548,7 @@ return view.extend({
 		}, [ _('Refresh') ]);
 
 		const updatedNode = E('span', { class: 'crq-updated' }, [ _('Last refresh: -') ]);
-		const metricPorts = make_metric(_('Ports enabled'), _('of ') + NUM_PORTS);
+		const metricPorts = make_metric(_('Ports enabled'), _('of ') + numPorts);
 		const metricPeak = make_metric(_('Peak rate'), _('Highest active shaper'));
 		const metricAvg = make_metric(_('Average rate'), _('Across enabled ports'));
 		const metricFlood = make_metric(_('Flood mask'), _('Multicast / Broadcast'));
@@ -582,6 +592,13 @@ return view.extend({
 		});
 
 		const applyFloodState = function(next) {
+			if (!floodSupported) {
+				floodMcastNow.textContent = '-';
+				floodBcastNow.textContent = '-';
+				metricFlood.set(_('N/A'), _('Unsupported by current backend'));
+				return;
+			}
+
 			const mcast = (next && next.mcast != null) ? +next.mcast : null;
 			const bcast = (next && next.bcast != null) ? +next.bcast : null;
 
@@ -592,12 +609,12 @@ return view.extend({
 
 		const applyStatusState = function(st) {
 			const ports = st.ports || [];
-			const byPort = status_map_by_port(ports);
+			const byPort = status_map_by_port(ports, numPorts);
 			let enabledCount = 0;
 			let activeRates = [];
 
 			for (let i = 0; i < ports.length; i++) {
-				if (ports[i] && +ports[i].port < NUM_PORTS && +ports[i].en) {
+				if (ports[i] && +ports[i].port < numPorts && +ports[i].en) {
 					enabledCount++;
 					activeRates.push(Math.round(+ports[i].rate_kbps || 0));
 				}
@@ -606,13 +623,13 @@ return view.extend({
 			const peakRate = activeRates.length ? Math.max.apply(null, activeRates) : 0;
 			const avgRate = activeRates.length ? Math.round(activeRates.reduce(function(a, b) { return a + b; }, 0) / activeRates.length) : 0;
 
-			metricPorts.set(String(enabledCount), _('of ') + NUM_PORTS);
+			metricPorts.set(String(enabledCount), _('of ') + numPorts);
 			metricPeak.set(fmt_rate_short(peakRate), peakRate + ' kbps');
 			metricAvg.set(fmt_rate_short(avgRate), avgRate + ' kbps');
 			metricBackend.set(helper_path_node(info.helper || '/usr/sbin/cr881x-yt921x-qos'));
 
 			portsWrap.innerHTML = '';
-			for (let port = 0; port < NUM_PORTS; port++)
+			for (let port = 0; port < numPorts; port++)
 				portsWrap.appendChild(port_card(port, byPort[port] || {}, applyPort));
 
 			set_raw_output(rawBox, st);
@@ -620,12 +637,13 @@ return view.extend({
 		};
 
 		const refreshState = function() {
-			return Promise.all([
-				L.resolveDefault(callStatus(), {}),
-				L.resolveDefault(callGetFloodFilter(), {})
-			]).then(function(next) {
+			const req = [ L.resolveDefault(callStatus(), {}) ];
+			if (floodSupported)
+				req.push(L.resolveDefault(callGetFloodFilter(), {}));
+
+			return Promise.all(req).then(function(next) {
 				const nextStatus = next[0] || {};
-				const nextFlood = next[1] || {};
+				const nextFlood = floodSupported ? (next[1] || {}) : {};
 
 				if (!nextStatus || !nextStatus.ok) {
 					ui.addNotification(null,
@@ -633,7 +651,7 @@ return view.extend({
 						'error');
 				}
 
-				if (!nextFlood || !nextFlood.ok) {
+				if (floodSupported && (!nextFlood || !nextFlood.ok)) {
 					ui.addNotification(null,
 						E('p', {}, [ (nextFlood && (nextFlood.error || nextFlood.output)) || _('Failed to refresh flood filter state.') ]),
 						'error');
@@ -665,6 +683,9 @@ return view.extend({
 		};
 
 		const applyFlood = function(target, mask, force) {
+			if (!floodSupported)
+				return Promise.resolve();
+
 			return L.resolveDefault(callSetFloodFilter(target, mask, force), {}).then(function(res) {
 				if (!res || !res.ok) {
 					ui.addNotification(null,
@@ -683,6 +704,8 @@ return view.extend({
 
 		floodApplyBtn.addEventListener('click', function(ev) {
 			ev.preventDefault();
+			if (!floodSupported)
+				return;
 
 			const parsedMask = parse_mask_input(floodMaskInput.value);
 			const force = floodForce.checked ? 1 : 0;
@@ -711,6 +734,45 @@ return view.extend({
 		applyFloodState(currentFlood);
 		applyStatusState(currentStatus);
 
+		const subtitleText = persistentSupported
+			? _('Per-port hardware shaping is stored in UCI and applied at boot.')
+			: _('Per-port hardware shaping and flood-filter control. Settings are runtime-only.');
+
+		const subtitleHint = persistentSupported
+			? _('Use this page for direct control; reboot keeps configured shaper values.')
+			: _('Use this page for quick tuning and diagnostics.');
+
+		const floodSection = floodSupported ? E('section', { class: 'crq-panel' }, [
+			E('h3', {}, [ _('Flood Filter') ]),
+			E('div', { class: 'crq-inline' }, [
+				E('span', {}, [ _('MCAST:'), ' ', floodMcastNow ]),
+				E('span', {}, [ _('BCAST:'), ' ', floodBcastNow ])
+			]),
+			E('div', { class: 'crq-row' }, [
+				floodTarget,
+				floodMaskInput,
+				E('label', {
+					style: 'display:flex;align-items:center;gap:4px;'
+				}, [
+					floodForce,
+					E('span', {}, [ _('Force 0x7ff') ])
+				]),
+				floodApplyBtn
+			]),
+			E('div', { class: 'crq-help' }, [
+				_('Safe default is 0x400 (drop flood to internal MCU only).'),
+				' ',
+				_('0x7ff can blackhole ARP/ND and break LAN reachability.')
+			])
+		]) : E('section', { class: 'crq-panel' }, [
+			E('h3', {}, [ _('Flood Filter') ]),
+			E('div', { class: 'crq-help' }, [
+				_('Flood filter control is not available on this backend.'),
+				' ',
+				_('Use release-safe tc/UCI shaper controls instead.')
+			])
+		]);
+
 		return E('div', { class: 'cbi-map' }, [
 			E('div', { class: 'crq-page' }, [
 				E('section', { class: 'crq-panel crq-hero' }, [
@@ -718,9 +780,9 @@ return view.extend({
 						E('div', {}, [
 							E('h2', { class: 'crq-title' }, [ _('CR881x QoS Offload (YT921x)') ]),
 							E('div', { class: 'crq-subtitle' }, [
-								_('Per-port hardware shaping and flood-filter control. Settings are runtime-only.'),
+								subtitleText,
 								' ',
-								_('Use this page for quick tuning and diagnostics.')
+								subtitleHint
 							]),
 							updatedNode
 						]),
@@ -734,29 +796,7 @@ return view.extend({
 						portsWrap
 					]),
 					E('div', { class: 'crq-side' }, [
-						E('section', { class: 'crq-panel' }, [
-							E('h3', {}, [ _('Flood Filter') ]),
-							E('div', { class: 'crq-inline' }, [
-								E('span', {}, [ _('MCAST:'), ' ', floodMcastNow ]),
-								E('span', {}, [ _('BCAST:'), ' ', floodBcastNow ])
-							]),
-							E('div', { class: 'crq-row' }, [
-								floodTarget,
-								floodMaskInput,
-								E('label', {
-									style: 'display:flex;align-items:center;gap:4px;'
-								}, [
-									floodForce,
-									E('span', {}, [ _('Force 0x7ff') ])
-								]),
-								floodApplyBtn
-							]),
-							E('div', { class: 'crq-help' }, [
-								_('Safe default is 0x400 (drop flood to internal MCU only).'),
-								' ',
-								_('0x7ff can blackhole ARP/ND and break LAN reachability.')
-							])
-						]),
+						floodSection,
 						E('section', { class: 'crq-panel crq-raw' }, [
 							E('h3', {}, [ _('Raw Helper Output') ]),
 							rawBox,
