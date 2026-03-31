@@ -159,16 +159,20 @@ function ensure_style() {
 			gap: 12px;
 		}
 
+		.crq-main.crq-main-noside {
+			grid-template-columns: 1fr;
+		}
+
 		.crq-port-grid {
 			display: grid;
-			grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-			gap: 10px;
+			grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+			gap: 8px;
 		}
 
 		.crq-port-card {
 			border: 1px solid var(--border-color-medium, #dfe3e8);
 			border-radius: 10px;
-			padding: 12px;
+			padding: 9px;
 			background: linear-gradient(180deg, #ffffff, #fbfcfd);
 		}
 
@@ -176,11 +180,11 @@ function ensure_style() {
 			display: flex;
 			justify-content: space-between;
 			align-items: center;
-			gap: 8px;
+			gap: 6px;
 		}
 
 		.crq-port-name {
-			font-size: 18px;
+			font-size: 15px;
 			font-weight: 700;
 		}
 
@@ -204,8 +208,8 @@ function ensure_style() {
 		.crq-port-live {
 			display: grid;
 			grid-template-columns: 1fr 1fr;
-			gap: 8px;
-			margin-top: 10px;
+			gap: 6px;
+			margin-top: 6px;
 		}
 
 		.crq-k {
@@ -223,7 +227,7 @@ function ensure_style() {
 			border-radius: 999px;
 			background: #e9edf2;
 			overflow: hidden;
-			margin-top: 8px;
+			margin-top: 6px;
 		}
 
 		.crq-meter > span {
@@ -236,7 +240,7 @@ function ensure_style() {
 			display: flex;
 			gap: 8px;
 			align-items: center;
-			margin-top: 10px;
+			margin-top: 8px;
 			flex-wrap: wrap;
 		}
 
@@ -250,9 +254,9 @@ function ensure_style() {
 		.crq-port-body {
 			display: grid;
 			grid-template-columns: 1fr auto;
-			gap: 12px;
+			gap: 8px;
 			align-items: start;
-			margin-top: 10px;
+			margin-top: 8px;
 		}
 
 		.crq-controls {
@@ -278,19 +282,29 @@ function ensure_style() {
 			margin: 0;
 			font-size: 12px;
 			color: var(--text-color-medium, #5f6c7b);
+			flex: 1;
+			min-width: 0;
+		}
+
+		.crq-num-input {
+			width: 8ch;
+			max-width: 100%;
+			text-align: right;
+			font-variant-numeric: tabular-nums;
 		}
 
 		.crq-presets-side {
 			display: flex;
 			flex-direction: column;
 			gap: 6px;
-			min-width: 74px;
+			min-width: 58px;
 		}
 
 		.crq-presets-side .cbi-button {
-			padding: 2px 9px;
+			padding: 2px 7px;
 			min-height: auto;
 			line-height: 1.35;
+			width: 100%;
 		}
 
 		.crq-field label {
@@ -310,16 +324,41 @@ function ensure_style() {
 		.crq-actions {
 			display: flex;
 			justify-content: flex-end;
-			margin-top: 12px;
+			margin-top: 8px;
 		}
 
-		.crq-side {
+		.crq-switch-master {
+			display: grid;
+			grid-template-columns: 1fr auto;
+			gap: 8px;
+			align-items: center;
+			margin-top: 4px;
+		}
+
+		.crq-switch-master label {
 			display: flex;
-			flex-direction: column;
-			gap: 12px;
+			align-items: center;
+			gap: 6px;
+			cursor: pointer;
+			font-size: 13px;
 		}
 
-		.crq-side h3,
+		.crq-switch-actions {
+			display: grid;
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+			gap: 6px;
+			margin-top: 6px;
+		}
+
+		.crq-btn-block {
+			width: 100%;
+			text-align: center;
+			min-height: 32px;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+		}
+
 		.crq-ports h3 {
 			margin: 0 0 8px;
 		}
@@ -349,10 +388,6 @@ function ensure_style() {
 			opacity: .72;
 		}
 
-		.crq-raw textarea {
-			min-height: 160px;
-		}
-
 		@media (max-width: 1100px) {
 			.crq-main {
 				grid-template-columns: 1fr;
@@ -376,6 +411,18 @@ function ensure_style() {
 			.crq-presets-side {
 				flex-direction: row;
 				flex-wrap: wrap;
+			}
+
+			.crq-presets-side .cbi-button {
+				width: auto;
+			}
+
+			.crq-switch-master {
+				grid-template-columns: 1fr;
+			}
+
+			.crq-switch-actions {
+				grid-template-columns: 1fr;
 			}
 		}
 	` ]));
@@ -487,10 +534,6 @@ function make_metric(title, hint) {
 	};
 }
 
-function set_raw_output(node, st) {
-	node.value = (st && st.output) ? st.output : '';
-}
-
 function port_card(port, st, apply_cb) {
 	const enabled = !!(+st.en);
 	const liveRate = Math.round(+st.rate_kbps || 0);
@@ -500,21 +543,22 @@ function port_card(port, st, apply_cb) {
 		inputmode: 'numeric',
 		pattern: '[0-9]*',
 		maxlength: '7',
-		class: 'cbi-input-text',
-		style: 'width:8ch;max-width:100%;'
+		class: 'cbi-input-text crq-num-input',
+		title: _('Rate in kbps') + ' (' + RATE_KBPS_MIN + '..' + RATE_KBPS_MAX + ')'
 	});
 	const burstInput = E('input', {
 		type: 'text',
 		inputmode: 'numeric',
 		pattern: '[0-9]*',
 		maxlength: '7',
-		class: 'cbi-input-text',
-		style: 'width:9ch;max-width:100%;'
+		class: 'cbi-input-text crq-num-input',
+		title: _('Burst size in bytes') + ' (' + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ')'
 	});
 	const enBox = E('input', { type: 'checkbox' });
 	const applyBtn = E('button', {
 		type: 'button',
-		class: 'cbi-button cbi-button-apply'
+		class: 'cbi-button cbi-button-apply',
+		title: _('Apply this port settings')
 	}, [ _('Apply') ]);
 
 	rateInput.value = String(Math.max(1, liveRate || 100000));
@@ -528,12 +572,36 @@ function port_card(port, st, apply_cb) {
 		input.value = v;
 	}
 
+	function clamp_digits_input(input, min, max, fallback, maxDigits) {
+		sanitize_digits_input(input, maxDigits);
+		if (!input.value) {
+			input.value = String(fallback);
+			return;
+		}
+
+		let n = parseInt(input.value, 10);
+		if (!Number.isFinite(n))
+			n = fallback;
+		if (n < min)
+			n = min;
+		if (n > max)
+			n = max;
+
+		input.value = String(n);
+	}
+
 	rateInput.addEventListener('input', function() {
 		sanitize_digits_input(rateInput, 7);
+	});
+	rateInput.addEventListener('blur', function() {
+		clamp_digits_input(rateInput, RATE_KBPS_MIN, RATE_KBPS_MAX, Math.max(1, liveRate || 100000), 7);
 	});
 
 	burstInput.addEventListener('input', function() {
 		sanitize_digits_input(burstInput, 7);
+	});
+	burstInput.addEventListener('blur', function() {
+		clamp_digits_input(burstInput, BURST_BYTES_MIN, BURST_BYTES_MAX, Math.max(64, liveBurst || DEFAULT_BURST_BYTES), 7);
 	});
 
 	const chip = E('span', { class: 'crq-chip' + (enabled ? '' : ' off') }, [ enabled ? _('Enabled') : _('Disabled') ]);
@@ -577,7 +645,8 @@ function port_card(port, st, apply_cb) {
 	].forEach(function(preset) {
 		const btn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-neutral'
+			class: 'cbi-button cbi-button-neutral',
+			title: _('Set rate to ') + preset[1]
 		}, [ preset[1] ]);
 
 		btn.addEventListener('click', function(ev) {
@@ -614,18 +683,23 @@ function port_card(port, st, apply_cb) {
 						E('span', {}, [ _('Enable shaper') ])
 					])
 				]),
-				E('div', { class: 'crq-fields-compact' }, [
-					E('div', { class: 'crq-field-row' }, [
-						E('label', {}, [ _('Rate (kbps)') ]),
-						rateInput
-					]),
+					E('div', { class: 'crq-fields-compact' }, [
+						E('div', { class: 'crq-field-row' }, [
+							E('label', {}, [ _('Rate (kbps)') ]),
+							rateInput
+						]),
 					E('div', { class: 'crq-field-row' }, [
 						E('label', {}, [ _('Burst (bytes)') ]),
-						burstInput
+							burstInput
+						])
+					]),
+					E('div', { class: 'crq-help', style: 'margin-top:6px;' }, [
+						_('Rate: ') + RATE_KBPS_MIN + '..' + RATE_KBPS_MAX + ' kbps',
+						' | ',
+						_('Burst: ') + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ' bytes'
 					])
-				])
-			]),
-			E('div', {}, [
+				]),
+				E('div', {}, [
 				E('div', { class: 'crq-k' }, [ _('Presets') ]),
 				presets
 			])
@@ -661,7 +735,8 @@ return view.extend({
 
 		const refreshBtn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-neutral'
+			class: 'cbi-button cbi-button-neutral',
+			title: _('Reload status from backend')
 		}, [ _('Refresh') ]);
 
 		const updatedNode = E('span', { class: 'crq-updated' }, [ _('Last refresh: -') ]);
@@ -691,26 +766,23 @@ return view.extend({
 			class: 'cbi-input-text',
 			type: 'text',
 			style: 'width: 10em;',
-			placeholder: '0x400'
+			placeholder: '0x400',
+			title: _('Flood filter mask (decimal or hex 0..0x7ff)')
 		});
 		floodMaskInput.value = fmt_mask_hex(FILTER_SAFE_DEFAULT);
 
 		const floodForce = E('input', { type: 'checkbox' });
 		const floodApplyBtn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-apply'
+			class: 'cbi-button cbi-button-apply',
+			title: _('Apply flood filter mask')
 		}, [ _('Apply filter mask') ]);
 
-		const rawBox = E('textarea', {
-			class: 'cbi-input-textarea',
-			readonly: true,
-			rows: 7,
-			style: 'width:100%;font-family:monospace;'
-		});
 		const globalEnable = E('input', { type: 'checkbox' });
 		const globalApplyBtn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-apply'
+			class: 'cbi-button cbi-button-apply',
+			title: _('Apply global QoS enable state')
 		}, [ _('Apply') ]);
 
 		const applyFloodState = function(next) {
@@ -756,7 +828,6 @@ return view.extend({
 			for (let port = 0; port < numPorts; port++)
 				portsWrap.appendChild(port_card(port, byPort[port] || {}, applyPort));
 
-			set_raw_output(rawBox, st);
 			updatedNode.textContent = _('Last refresh: ') + new Date().toLocaleTimeString();
 		};
 
@@ -856,7 +927,8 @@ return view.extend({
 
 		const disableAllBtn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-negative'
+			class: 'cbi-button cbi-button-negative crq-btn-block',
+			title: _('Disable shaper on all ports')
 		}, [ _('Disable all shapers') ]);
 
 		disableAllBtn.addEventListener('click', function(ev) {
@@ -874,7 +946,8 @@ return view.extend({
 
 		const lan100Btn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-action'
+			class: 'cbi-button cbi-button-action crq-btn-block',
+			title: _('Enable LAN1-3 shapers at 100 Mbps')
 		}, [ _('LAN ports 100M') ]);
 
 		lan100Btn.addEventListener('click', function(ev) {
@@ -892,7 +965,8 @@ return view.extend({
 
 		const wan300Btn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-action'
+			class: 'cbi-button cbi-button-action crq-btn-block',
+			title: _('Enable WAN shaper at 300 Mbps')
 		}, [ _('WAN 300M cap') ]);
 
 		wan300Btn.addEventListener('click', function(ev) {
@@ -908,6 +982,39 @@ return view.extend({
 			});
 		});
 
+		const resetSafeBtn = E('button', {
+			type: 'button',
+			class: 'cbi-button cbi-button-neutral crq-btn-block',
+			title: _('Enable global QoS, disable all shapers, and set safe flood mask')
+		}, [ _('Reset safe defaults') ]);
+
+		resetSafeBtn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			if (!window.confirm(_('Reset to safe defaults?')))
+				return;
+
+			resetSafeBtn.disabled = true;
+			const entries = [];
+			for (let p = 0; p < numPorts; p++)
+				entries.push({ port: p, enable: 0, rate: 0, burst: DEFAULT_BURST_BYTES });
+
+			let chain = Promise.resolve(applyGlobal(1)).then(function() {
+				return runBulk(entries);
+			});
+
+			if (floodSupported) {
+				chain = chain.then(function() {
+					return applyFlood('both', fmt_mask_hex(FILTER_SAFE_DEFAULT), 0);
+				});
+			}
+
+			chain.then(function() {
+				return refreshState();
+			}).finally(function() {
+				resetSafeBtn.disabled = false;
+			});
+		});
+
 		globalApplyBtn.addEventListener('click', function(ev) {
 			ev.preventDefault();
 			globalApplyBtn.disabled = true;
@@ -919,6 +1026,11 @@ return view.extend({
 		refreshBtn.addEventListener('click', function(ev) {
 			ev.preventDefault();
 			refreshState();
+		});
+
+		floodMaskInput.addEventListener('blur', function() {
+			const parsedMask = parse_mask_input(floodMaskInput.value);
+			floodMaskInput.value = fmt_mask_hex(parsedMask == null ? FILTER_SAFE_DEFAULT : parsedMask);
 		});
 
 		floodApplyBtn.addEventListener('click', function(ev) {
@@ -961,9 +1073,11 @@ return view.extend({
 			? _('Use this page for direct control; reboot keeps configured shaper values.')
 			: _('Use this page for quick tuning and diagnostics.');
 
-		const floodSection = floodSupported ? E('section', { class: 'crq-panel' }, [
-			E('h3', {}, [ _('Flood Filter') ]),
-			E('div', { class: 'crq-inline' }, [
+		const floodAdvanced = floodSupported ? E('details', { style: 'margin-top:8px;' }, [
+			E('summary', {
+				style: 'cursor:pointer;font-weight:600;'
+			}, [ _('Advanced flood filter') ]),
+			E('div', { class: 'crq-inline', style: 'margin-top:8px;' }, [
 				E('span', {}, [ _('MCAST:'), ' ', floodMcastNow ]),
 				E('span', {}, [ _('BCAST:'), ' ', floodBcastNow ])
 			]),
@@ -983,89 +1097,100 @@ return view.extend({
 				' ',
 				_('0x7ff can blackhole ARP/ND and break LAN reachability.')
 			])
-		]) : E('section', { class: 'crq-panel' }, [
-			E('h3', {}, [ _('Flood Filter') ]),
-			E('div', { class: 'crq-help' }, [
-				_('Flood filter control is not available on this backend.'),
-				' ',
-				_('Use release-safe tc/UCI shaper controls instead.')
-			])
-		]);
+		]) : null;
 
-		const switchExtraPanel = E('section', { class: 'crq-panel' }, [
+		const switchExtraPanelChildren = [
 			E('h3', {}, [ _('Switch QoS Controls') ]),
-			E('div', { class: 'crq-row' }, [
-				E('label', {
-					style: 'display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;'
-				}, [
+			E('div', { class: 'crq-switch-master' }, [
+				E('label', {}, [
 					globalEnable,
 					E('span', {}, [ _('Global QoS enable (persistent)') ])
 				]),
 				globalApplyBtn
 			]),
-			E('div', { class: 'crq-row' }, [
-				disableAllBtn,
-				lan100Btn,
-				wan300Btn
-			]),
+				E('div', { class: 'crq-switch-actions' }, [
+					disableAllBtn,
+					lan100Btn,
+					wan300Btn,
+					resetSafeBtn
+				]),
 			E('div', { class: 'crq-help' }, [
 				_('These shortcuts use the same hardware offload backend as per-port settings.'),
 				' ',
 				_('Global toggle controls boot-time apply behavior via UCI.')
 			])
-		]);
+		];
+
+		if (floodAdvanced)
+			switchExtraPanelChildren.push(floodAdvanced);
+
+		const switchExtraPanel = E('section', { class: 'crq-panel' }, switchExtraPanelChildren);
 
 		const wifiDraftPanel = E('section', { class: 'crq-panel' }, [
-			E('h3', {}, [ _('Wi-Fi / Guest QoS (Draft)') ]),
-			E('div', { class: 'crq-help' }, [
-				_('UI draft only. Not wired yet.'),
-				' ',
-				_('Planned for software QoS on wlan/br-guest interfaces.')
-			]),
-			E('fieldset', { class: 'crq-draft-muted', disabled: 'disabled' }, [
-				E('div', { class: 'crq-draft-grid' }, [
-					E('div', { class: 'crq-field' }, [
-						E('label', {}, [ _('Target interface') ]),
-						E('select', { class: 'cbi-input-select' }, [
-							E('option', {}, [ 'br-guest' ]),
-							E('option', {}, [ 'wlan0-1' ]),
-							E('option', {}, [ 'wlan1-1' ])
-						])
-					]),
-					E('div', { class: 'crq-field' }, [
-						E('label', {}, [ _('Mode') ]),
-						E('select', { class: 'cbi-input-select' }, [
-							E('option', {}, [ _('Balanced') ]),
-							E('option', {}, [ _('Low latency') ]),
-							E('option', {}, [ _('Bulk limit') ])
-						])
-					]),
-					E('div', { class: 'crq-field' }, [
-						E('label', {}, [ _('Upload cap (Mbps)') ]),
-						E('input', {
-							type: 'number',
-							class: 'cbi-input-text',
-							value: '50'
-						})
-					]),
-					E('div', { class: 'crq-field' }, [
-						E('label', {}, [ _('Download cap (Mbps)') ]),
-						E('input', {
-							type: 'number',
-							class: 'cbi-input-text',
-							value: '100'
-						})
-					])
+			E('details', {}, [
+				E('summary', {
+					style: 'cursor:pointer;font-weight:700;'
+				}, [ _('Wi-Fi / Guest QoS (Draft)') ]),
+				E('div', { class: 'crq-help', style: 'margin-top:8px;' }, [
+					_('UI draft only. Not wired yet.'),
+					' ',
+					_('Planned for software QoS on wlan/br-guest interfaces.')
 				]),
-				E('div', { class: 'crq-actions' }, [
-					E('button', {
-						type: 'button',
-						class: 'cbi-button cbi-button-apply',
-						disabled: 'disabled'
-					}, [ _('Apply (coming soon)') ])
+				E('fieldset', { class: 'crq-draft-muted', disabled: 'disabled' }, [
+					E('div', { class: 'crq-draft-grid' }, [
+						E('div', { class: 'crq-field' }, [
+							E('label', {}, [ _('Target interface') ]),
+							E('select', { class: 'cbi-input-select' }, [
+								E('option', {}, [ 'br-guest' ]),
+								E('option', {}, [ 'wlan0-1' ]),
+								E('option', {}, [ 'wlan1-1' ])
+							])
+						]),
+						E('div', { class: 'crq-field' }, [
+							E('label', {}, [ _('Mode') ]),
+							E('select', { class: 'cbi-input-select' }, [
+								E('option', {}, [ _('Balanced') ]),
+								E('option', {}, [ _('Low latency') ]),
+								E('option', {}, [ _('Bulk limit') ])
+							])
+						]),
+						E('div', { class: 'crq-field' }, [
+							E('label', {}, [ _('Upload cap (Mbps)') ]),
+							E('input', {
+								type: 'number',
+								class: 'cbi-input-text',
+								value: '50'
+							})
+						]),
+						E('div', { class: 'crq-field' }, [
+							E('label', {}, [ _('Download cap (Mbps)') ]),
+							E('input', {
+								type: 'number',
+								class: 'cbi-input-text',
+								value: '100'
+							})
+						])
+					]),
+					E('div', { class: 'crq-actions' }, [
+						E('button', {
+							type: 'button',
+							class: 'cbi-button cbi-button-apply',
+							disabled: 'disabled'
+						}, [ _('Apply (coming soon)') ])
+					])
 				])
 			])
 		]);
+
+		const mainClass = 'crq-main crq-main-noside';
+		const mainChildren = [
+			E('section', { class: 'crq-panel crq-ports' }, [
+				E('h3', {}, [ _('Port Shapers') ]),
+				portsWrap
+			]),
+			switchExtraPanel,
+			wifiDraftPanel
+		];
 
 		return E('div', { class: 'cbi-map' }, [
 			E('div', { class: 'crq-page' }, [
@@ -1084,25 +1209,7 @@ return view.extend({
 					]),
 					summaryWrap
 				]),
-				E('div', { class: 'crq-main' }, [
-					E('section', { class: 'crq-panel crq-ports' }, [
-						E('h3', {}, [ _('Port Shapers') ]),
-						portsWrap
-					]),
-					switchExtraPanel,
-					wifiDraftPanel,
-					E('div', { class: 'crq-side' }, [
-						floodSection,
-						E('section', { class: 'crq-panel crq-raw' }, [
-							E('h3', {}, [ _('Raw Helper Output') ]),
-							rawBox,
-							E('div', { class: 'crq-help' }, [
-								_('Helper path: '),
-								helper_path_node(info.helper || '/usr/sbin/cr881x-yt921x-qos')
-							])
-						])
-					])
-				])
+				E('div', { class: mainClass }, mainChildren)
 			])
 		]);
 	}
