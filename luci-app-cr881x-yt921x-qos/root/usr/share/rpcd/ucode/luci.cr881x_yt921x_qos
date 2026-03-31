@@ -8,6 +8,10 @@ const helper = '/usr/sbin/cr881x-yt921x-qos';
 const port_max = 3;
 const default_burst_bytes = 65536;
 const filter_mask_max = 0x7ff;
+const rate_kbps_min = 1;
+const rate_kbps_max = 2500000;
+const burst_bytes_min = 64;
+const burst_bytes_max = 1048512;
 
 function shell_quote(s) {
 	if (s == null || s == '')
@@ -61,6 +65,8 @@ function parse_tbf_line(line) {
 		meter: 0,
 		eir: 0,
 		ebs: 0,
+		rate_kbps: -1,
+		burst_bytes: -1,
 		raw: line
 	};
 
@@ -84,25 +90,44 @@ function parse_tbf_line(line) {
 			item.eir = +v;
 		else if (k == 'ebs')
 			item.ebs = +v;
+		else if (k == 'rate_kbps')
+			item.rate_kbps = +v;
+		else if (k == 'burst_bytes')
+			item.burst_bytes = +v;
 	}
 
-	item.rate_kbps = (item.eir * 1000) / 1548;
-	item.burst_bytes = item.ebs * 64;
+	if (!(item.rate_kbps >= 0))
+		item.rate_kbps = (item.eir * 1000) / 1548;
+
+	if (!(item.burst_bytes >= 0))
+		item.burst_bytes = item.ebs * 64;
 
 	return item;
 }
 
 function parse_status_output(output) {
 	let ports = [];
+	let global_enabled = 1;
 	let lines = split(output, '\n');
 
 	for (let i = 0; i < length(lines); i++) {
+		let line = trim(lines[i]);
+		if (index(line, 'global enabled=') == 0) {
+			let val = trim(substr(line, 15));
+			if (val == '0' || val == '1')
+				global_enabled = int(+val);
+			continue;
+		}
+
 		let p = parse_tbf_line(lines[i]);
 		if (p != null)
 			ports[length(ports)] = p;
 	}
 
-	return ports;
+	return {
+		global_enabled,
+		ports
+	};
 }
 
 function status_call() {
@@ -115,26 +140,55 @@ function status_call() {
 	}
 
 	const res = run_helper([ 'status' ]);
-	const ports = parse_status_output(res.output);
+	const parsed = parse_status_output(res.output);
 
 	return {
 		ok: (res.code == 0),
 		code: res.code,
 		error: (res.code == 0) ? '' : (res.output || 'status failed'),
 		output: res.output,
-		ports
+		global_enabled: parsed.global_enabled,
+		ports: parsed.ports
 	};
 }
 
-function parse_nonneg_int(v, fallback) {
+function is_decimal_uint(v, max_digits) {
+	v = trim(`${v ?? ''}`);
+	if (!v || length(v) > max_digits)
+		return false;
+
+	for (let i = 0; i < length(v); i++) {
+		const c = substr(v, i, 1);
+		if (c < '0' || c > '9')
+			return false;
+	}
+
+	return true;
+}
+
+function parse_uint_bounded(v, fallback, min, max, max_digits) {
 	if (v == null || v == '')
 		return fallback;
 
-	const n = +v;
-	if (!(n >= 0))
+	if (!is_decimal_uint(v, max_digits))
 		return null;
 
-	return int(n);
+	const n = int(+v);
+	if (!(n >= min && n <= max))
+		return null;
+
+	return n;
+}
+
+function parse_bool01(v, fallback) {
+	if (v == null || v == '')
+		return fallback;
+
+	v = trim(`${v}`);
+	if (v == '0' || v == '1')
+		return int(+v);
+
+	return null;
 }
 
 function parse_flood_output(output) {
@@ -218,10 +272,10 @@ function set_port_call(args) {
 		};
 	}
 
-	const port = parse_nonneg_int(args?.port, null);
-	const enable = parse_nonneg_int(args?.enable, 1);
-	const rate_kbps = parse_nonneg_int(args?.rate_kbps, 0);
-	const burst_bytes = parse_nonneg_int(args?.burst_bytes, default_burst_bytes);
+	const port = parse_uint_bounded(args?.port, null, 0, port_max, 1);
+	const enable = parse_bool01(args?.enable, 1);
+	const rate_kbps = parse_uint_bounded(args?.rate_kbps, 0, rate_kbps_min, rate_kbps_max, 7);
+	const burst_bytes = parse_uint_bounded(args?.burst_bytes, default_burst_bytes, burst_bytes_min, burst_bytes_max, 7);
 
 	if (port == null || port > port_max) {
 		return {
@@ -231,23 +285,31 @@ function set_port_call(args) {
 		};
 	}
 
-	if (enable && rate_kbps <= 0) {
+	if (enable == null) {
 		return {
 			ok: false,
 			code: -22,
-			error: 'rate_kbps must be > 0 when enabled'
+			error: 'enable must be 0 or 1'
 		};
 	}
 
-	if (enable && burst_bytes <= 0) {
+	if (enable && rate_kbps == null) {
 		return {
 			ok: false,
 			code: -22,
-			error: 'burst_bytes must be > 0 when enabled'
+			error: `rate_kbps must be ${rate_kbps_min}..${rate_kbps_max} when enabled`
 		};
 	}
 
-	const cmd = (!enable || rate_kbps <= 0) ? 'disable-port' : 'set-port';
+	if (enable && burst_bytes == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: `burst_bytes must be ${burst_bytes_min}..${burst_bytes_max} when enabled`
+		};
+	}
+
+	const cmd = !enable ? 'disable-port' : 'set-port';
 	const cmd_args = [ cmd, `${port}` ];
 	if (cmd == 'set-port') {
 		cmd_args[length(cmd_args)] = `${rate_kbps}`;
@@ -261,6 +323,36 @@ function set_port_call(args) {
 		ok: (res.code == 0),
 		code: res.code,
 		error: (res.code == 0) ? '' : (res.output || 'set_port failed'),
+		output: res.output,
+		status: st
+	};
+}
+
+function set_global_call(args) {
+	if (!access(helper, 'x')) {
+		return {
+			ok: false,
+			code: 127,
+			error: `${helper} is missing`
+		};
+	}
+
+	const enable = parse_bool01(args?.enable, null);
+	if (enable == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'enable must be 0 or 1'
+		};
+	}
+
+	const res = run_helper([ 'set-global', `${enable}` ]);
+	const st = status_call();
+
+	return {
+		ok: (res.code == 0),
+		code: res.code,
+		error: (res.code == 0) ? '' : (res.output || 'set_global failed'),
 		output: res.output,
 		status: st
 	};
@@ -285,7 +377,7 @@ function set_flood_filter_call(args) {
 
 	const target = trim(`${args?.target || ''}`);
 	const mask = trim(`${args?.mask || ''}`);
-	const force = parse_nonneg_int(args?.force, 0);
+	const force = parse_bool01(args?.force, 0);
 
 	if (target != 'mcast' && target != 'bcast' && target != 'both') {
 		return {
@@ -300,6 +392,14 @@ function set_flood_filter_call(args) {
 			ok: false,
 			code: -22,
 			error: 'mask is required'
+		};
+	}
+
+	if (force == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'force must be 0 or 1'
 		};
 	}
 
@@ -347,6 +447,15 @@ const methods = {
 		},
 		call: function(req) {
 			return set_port_call(req?.args || {});
+		}
+	},
+
+	set_global: {
+		args: {
+			enable: 'enable'
+		},
+		call: function(req) {
+			return set_global_call(req?.args || {});
 		}
 	},
 

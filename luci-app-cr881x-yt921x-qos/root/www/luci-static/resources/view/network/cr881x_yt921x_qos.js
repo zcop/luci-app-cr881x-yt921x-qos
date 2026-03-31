@@ -5,6 +5,10 @@
 
 const NUM_PORTS = 4;
 const DEFAULT_BURST_BYTES = 65536;
+const RATE_KBPS_MIN = 1;
+const RATE_KBPS_MAX = 2500000;
+const BURST_BYTES_MIN = 64;
+const BURST_BYTES_MAX = 1048512;
 const FILTER_MASK_MAX = 0x7ff;
 const FILTER_MASK_DANGEROUS = 0x7ff;
 const FILTER_SAFE_DEFAULT = 0x400;
@@ -43,6 +47,13 @@ const callSetPort = rpc.declare({
 	object: 'luci.cr881x_yt921x_qos',
 	method: 'set_port',
 	params: [ 'port', 'enable', 'rate_kbps', 'burst_bytes' ],
+	expect: {}
+});
+
+const callSetGlobal = rpc.declare({
+	object: 'luci.cr881x_yt921x_qos',
+	method: 'set_global',
+	params: [ 'enable' ],
 	expect: {}
 });
 
@@ -236,6 +247,52 @@ function ensure_style() {
 			margin-top: 10px;
 		}
 
+		.crq-port-body {
+			display: grid;
+			grid-template-columns: 1fr auto;
+			gap: 12px;
+			align-items: start;
+			margin-top: 10px;
+		}
+
+		.crq-controls {
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+		}
+
+		.crq-fields-compact {
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+		}
+
+		.crq-field-row {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: 8px;
+		}
+
+		.crq-field-row > label {
+			margin: 0;
+			font-size: 12px;
+			color: var(--text-color-medium, #5f6c7b);
+		}
+
+		.crq-presets-side {
+			display: flex;
+			flex-direction: column;
+			gap: 6px;
+			min-width: 74px;
+		}
+
+		.crq-presets-side .cbi-button {
+			padding: 2px 9px;
+			min-height: auto;
+			line-height: 1.35;
+		}
+
 		.crq-field label {
 			display: block;
 			font-size: 12px;
@@ -281,6 +338,17 @@ function ensure_style() {
 			line-height: 1.45;
 		}
 
+		.crq-draft-grid {
+			display: grid;
+			grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+			gap: 10px;
+			margin-top: 10px;
+		}
+
+		.crq-draft-muted {
+			opacity: .72;
+		}
+
 		.crq-raw textarea {
 			min-height: 160px;
 		}
@@ -300,6 +368,15 @@ function ensure_style() {
 			.crq-fields {
 				grid-template-columns: 1fr;
 			}
+
+			.crq-port-body {
+				grid-template-columns: 1fr;
+			}
+
+			.crq-presets-side {
+				flex-direction: row;
+				flex-wrap: wrap;
+			}
 		}
 	` ]));
 }
@@ -307,6 +384,20 @@ function ensure_style() {
 function parse_int(v, fallback) {
 	const n = parseInt(v, 10);
 	return Number.isFinite(n) ? n : fallback;
+}
+
+function parse_uint_bounded(v, min, max, maxDigits) {
+	const s = String(v == null ? '' : v).trim();
+	if (!/^[0-9]+$/.test(s))
+		return null;
+	if (s.length > maxDigits)
+		return null;
+
+	const n = Number(s);
+	if (!Number.isInteger(n) || n < min || n > max)
+		return null;
+
+	return n;
 }
 
 function parse_mask_input(v) {
@@ -405,18 +496,20 @@ function port_card(port, st, apply_cb) {
 	const liveRate = Math.round(+st.rate_kbps || 0);
 	const liveBurst = parse_int(st.burst_bytes, DEFAULT_BURST_BYTES);
 	const rateInput = E('input', {
-		type: 'number',
-		min: '1',
-		step: '1',
+		type: 'text',
+		inputmode: 'numeric',
+		pattern: '[0-9]*',
+		maxlength: '7',
 		class: 'cbi-input-text',
-		style: 'width:100%;'
+		style: 'width:8ch;max-width:100%;'
 	});
 	const burstInput = E('input', {
-		type: 'number',
-		min: '64',
-		step: '64',
+		type: 'text',
+		inputmode: 'numeric',
+		pattern: '[0-9]*',
+		maxlength: '7',
 		class: 'cbi-input-text',
-		style: 'width:100%;'
+		style: 'width:9ch;max-width:100%;'
 	});
 	const enBox = E('input', { type: 'checkbox' });
 	const applyBtn = E('button', {
@@ -428,6 +521,21 @@ function port_card(port, st, apply_cb) {
 	burstInput.value = String(Math.max(64, liveBurst || DEFAULT_BURST_BYTES));
 	enBox.checked = enabled;
 
+	function sanitize_digits_input(input, maxDigits) {
+		let v = String(input.value == null ? '' : input.value).replace(/[^0-9]/g, '');
+		if (v.length > maxDigits)
+			v = v.slice(0, maxDigits);
+		input.value = v;
+	}
+
+	rateInput.addEventListener('input', function() {
+		sanitize_digits_input(rateInput, 7);
+	});
+
+	burstInput.addEventListener('input', function() {
+		sanitize_digits_input(burstInput, 7);
+	});
+
 	const chip = E('span', { class: 'crq-chip' + (enabled ? '' : ' off') }, [ enabled ? _('Enabled') : _('Disabled') ]);
 	const meterFill = E('span', { style: 'width:' + Math.max(1, Math.min(100, Math.round((liveRate / 1000000) * 100))) + '%;' });
 
@@ -435,16 +543,20 @@ function port_card(port, st, apply_cb) {
 		ev.preventDefault();
 
 		const enable = enBox.checked ? 1 : 0;
-		const rate = parse_int(rateInput.value, 0);
-		const burst = parse_int(burstInput.value, 0);
+		const rate = parse_uint_bounded(rateInput.value, RATE_KBPS_MIN, RATE_KBPS_MAX, 7);
+		const burst = parse_uint_bounded(burstInput.value, BURST_BYTES_MIN, BURST_BYTES_MAX, 7);
 
-		if (enable && rate <= 0) {
-			ui.addNotification(null, E('p', {}, [ _('Rate must be > 0 kbps') ]), 'error');
+		if (enable && rate == null) {
+			ui.addNotification(null, E('p', {}, [
+				_('Rate must be numeric and in range ') + RATE_KBPS_MIN + '..' + RATE_KBPS_MAX + ' kbps'
+			]), 'error');
 			return;
 		}
 
-		if (enable && burst <= 0) {
-			ui.addNotification(null, E('p', {}, [ _('Burst must be > 0 bytes') ]), 'error');
+		if (enable && burst == null) {
+			ui.addNotification(null, E('p', {}, [
+				_('Burst must be numeric and in range ') + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ' bytes'
+			]), 'error');
 			return;
 		}
 
@@ -456,7 +568,7 @@ function port_card(port, st, apply_cb) {
 
 	applyBtn.addEventListener('click', run_apply);
 
-	const presets = E('div', { class: 'crq-presets' });
+	const presets = E('div', { class: 'crq-presets-side' });
 	[
 		[ 50000, '50M' ],
 		[ 100000, '100M' ],
@@ -465,8 +577,7 @@ function port_card(port, st, apply_cb) {
 	].forEach(function(preset) {
 		const btn = E('button', {
 			type: 'button',
-			class: 'cbi-button cbi-button-neutral',
-			style: 'padding:2px 9px;min-height:auto;line-height:1.35;'
+			class: 'cbi-button cbi-button-neutral'
 		}, [ preset[1] ]);
 
 		btn.addEventListener('click', function(ev) {
@@ -493,26 +604,32 @@ function port_card(port, st, apply_cb) {
 			])
 		]),
 		E('div', { class: 'crq-meter' }, [ meterFill ]),
-		E('div', { class: 'crq-row' }, [
-			E('label', {
-				style: 'display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;'
-			}, [
-				enBox,
-				E('span', {}, [ _('Enable shaper') ])
-			])
-		]),
-		E('div', { class: 'crq-fields' }, [
-			E('div', { class: 'crq-field' }, [
-				E('label', {}, [ _('Rate (kbps)') ]),
-				rateInput
+		E('div', { class: 'crq-port-body' }, [
+			E('div', { class: 'crq-controls' }, [
+				E('div', { class: 'crq-row', style: 'margin-top:0;' }, [
+					E('label', {
+						style: 'display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;'
+					}, [
+						enBox,
+						E('span', {}, [ _('Enable shaper') ])
+					])
+				]),
+				E('div', { class: 'crq-fields-compact' }, [
+					E('div', { class: 'crq-field-row' }, [
+						E('label', {}, [ _('Rate (kbps)') ]),
+						rateInput
+					]),
+					E('div', { class: 'crq-field-row' }, [
+						E('label', {}, [ _('Burst (bytes)') ]),
+						burstInput
+					])
+				])
 			]),
-			E('div', { class: 'crq-field' }, [
-				E('label', {}, [ _('Burst (bytes)') ]),
-				burstInput
+			E('div', {}, [
+				E('div', { class: 'crq-k' }, [ _('Presets') ]),
+				presets
 			])
 		]),
-		E('div', { class: 'crq-k', style: 'margin-top:8px;' }, [ _('Quick presets') ]),
-		presets,
 		E('div', { class: 'crq-actions' }, [ applyBtn ])
 	]);
 }
@@ -590,6 +707,11 @@ return view.extend({
 			rows: 7,
 			style: 'width:100%;font-family:monospace;'
 		});
+		const globalEnable = E('input', { type: 'checkbox' });
+		const globalApplyBtn = E('button', {
+			type: 'button',
+			class: 'cbi-button cbi-button-apply'
+		}, [ _('Apply') ]);
 
 		const applyFloodState = function(next) {
 			if (!floodSupported) {
@@ -610,6 +732,7 @@ return view.extend({
 		const applyStatusState = function(st) {
 			const ports = st.ports || [];
 			const byPort = status_map_by_port(ports, numPorts);
+			const globalEnabled = +st.global_enabled ? 1 : 0;
 			let enabledCount = 0;
 			let activeRates = [];
 
@@ -627,6 +750,7 @@ return view.extend({
 			metricPeak.set(fmt_rate_short(peakRate), peakRate + ' kbps');
 			metricAvg.set(fmt_rate_short(avgRate), avgRate + ' kbps');
 			metricBackend.set(helper_path_node(info.helper || '/usr/sbin/cr881x-yt921x-qos'));
+			globalEnable.checked = !!globalEnabled;
 
 			portsWrap.innerHTML = '';
 			for (let port = 0; port < numPorts; port++)
@@ -682,6 +806,24 @@ return view.extend({
 			});
 		};
 
+		const applyGlobal = function(enable) {
+			return L.resolveDefault(callSetGlobal(enable), {}).then(function(res) {
+				if (!res || !res.ok) {
+					ui.addNotification(null,
+						E('p', {}, [ (res && (res.error || res.output)) || _('Failed to apply global QoS setting.') ]),
+						'error');
+				}
+
+				if (res && res.status) {
+					currentStatus = res.status;
+					applyStatusState(currentStatus);
+					return;
+				}
+
+				return refreshState();
+			});
+		};
+
 		const applyFlood = function(target, mask, force) {
 			if (!floodSupported)
 				return Promise.resolve();
@@ -696,6 +838,83 @@ return view.extend({
 				return refreshState();
 			});
 		};
+
+		const runBulk = function(entries) {
+			let chain = Promise.resolve();
+
+			for (let i = 0; i < entries.length; i++) {
+				const e = entries[i];
+				chain = chain.then(function() {
+					return applyPort(e.port, e.enable, e.rate, e.burst);
+				});
+			}
+
+			return chain.then(function() {
+				return refreshState();
+			});
+		};
+
+		const disableAllBtn = E('button', {
+			type: 'button',
+			class: 'cbi-button cbi-button-negative'
+		}, [ _('Disable all shapers') ]);
+
+		disableAllBtn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			disableAllBtn.disabled = true;
+
+			const entries = [];
+			for (let p = 0; p < numPorts; p++)
+				entries.push({ port: p, enable: 0, rate: 0, burst: DEFAULT_BURST_BYTES });
+
+			runBulk(entries).finally(function() {
+				disableAllBtn.disabled = false;
+			});
+		});
+
+		const lan100Btn = E('button', {
+			type: 'button',
+			class: 'cbi-button cbi-button-action'
+		}, [ _('LAN ports 100M') ]);
+
+		lan100Btn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			lan100Btn.disabled = true;
+
+			const entries = [];
+			for (let p = 0; p < Math.min(3, numPorts); p++)
+				entries.push({ port: p, enable: 1, rate: 100000, burst: DEFAULT_BURST_BYTES });
+
+			runBulk(entries).finally(function() {
+				lan100Btn.disabled = false;
+			});
+		});
+
+		const wan300Btn = E('button', {
+			type: 'button',
+			class: 'cbi-button cbi-button-action'
+		}, [ _('WAN 300M cap') ]);
+
+		wan300Btn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			wan300Btn.disabled = true;
+			runBulk([{
+				port: Math.min(3, numPorts - 1),
+				enable: 1,
+				rate: 300000,
+				burst: DEFAULT_BURST_BYTES
+			}]).finally(function() {
+				wan300Btn.disabled = false;
+			});
+		});
+
+		globalApplyBtn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+			globalApplyBtn.disabled = true;
+			Promise.resolve(applyGlobal(globalEnable.checked ? 1 : 0)).finally(function() {
+				globalApplyBtn.disabled = false;
+			});
+		});
 
 		refreshBtn.addEventListener('click', function(ev) {
 			ev.preventDefault();
@@ -773,6 +992,81 @@ return view.extend({
 			])
 		]);
 
+		const switchExtraPanel = E('section', { class: 'crq-panel' }, [
+			E('h3', {}, [ _('Switch QoS Controls') ]),
+			E('div', { class: 'crq-row' }, [
+				E('label', {
+					style: 'display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;'
+				}, [
+					globalEnable,
+					E('span', {}, [ _('Global QoS enable (persistent)') ])
+				]),
+				globalApplyBtn
+			]),
+			E('div', { class: 'crq-row' }, [
+				disableAllBtn,
+				lan100Btn,
+				wan300Btn
+			]),
+			E('div', { class: 'crq-help' }, [
+				_('These shortcuts use the same hardware offload backend as per-port settings.'),
+				' ',
+				_('Global toggle controls boot-time apply behavior via UCI.')
+			])
+		]);
+
+		const wifiDraftPanel = E('section', { class: 'crq-panel' }, [
+			E('h3', {}, [ _('Wi-Fi / Guest QoS (Draft)') ]),
+			E('div', { class: 'crq-help' }, [
+				_('UI draft only. Not wired yet.'),
+				' ',
+				_('Planned for software QoS on wlan/br-guest interfaces.')
+			]),
+			E('fieldset', { class: 'crq-draft-muted', disabled: 'disabled' }, [
+				E('div', { class: 'crq-draft-grid' }, [
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Target interface') ]),
+						E('select', { class: 'cbi-input-select' }, [
+							E('option', {}, [ 'br-guest' ]),
+							E('option', {}, [ 'wlan0-1' ]),
+							E('option', {}, [ 'wlan1-1' ])
+						])
+					]),
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Mode') ]),
+						E('select', { class: 'cbi-input-select' }, [
+							E('option', {}, [ _('Balanced') ]),
+							E('option', {}, [ _('Low latency') ]),
+							E('option', {}, [ _('Bulk limit') ])
+						])
+					]),
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Upload cap (Mbps)') ]),
+						E('input', {
+							type: 'number',
+							class: 'cbi-input-text',
+							value: '50'
+						})
+					]),
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Download cap (Mbps)') ]),
+						E('input', {
+							type: 'number',
+							class: 'cbi-input-text',
+							value: '100'
+						})
+					])
+				]),
+				E('div', { class: 'crq-actions' }, [
+					E('button', {
+						type: 'button',
+						class: 'cbi-button cbi-button-apply',
+						disabled: 'disabled'
+					}, [ _('Apply (coming soon)') ])
+				])
+			])
+		]);
+
 		return E('div', { class: 'cbi-map' }, [
 			E('div', { class: 'crq-page' }, [
 				E('section', { class: 'crq-panel crq-hero' }, [
@@ -795,6 +1089,8 @@ return view.extend({
 						E('h3', {}, [ _('Port Shapers') ]),
 						portsWrap
 					]),
+					switchExtraPanel,
+					wifiDraftPanel,
 					E('div', { class: 'crq-side' }, [
 						floodSection,
 						E('section', { class: 'crq-panel crq-raw' }, [

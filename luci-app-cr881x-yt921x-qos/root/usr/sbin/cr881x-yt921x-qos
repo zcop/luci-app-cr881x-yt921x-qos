@@ -4,6 +4,10 @@ set -eu
 
 PORT_MAX=3
 DEFAULT_BURST_BYTES=65536
+DEFAULT_RATE_KBPS=100000
+
+RATE_KBPS_MIN=1
+RATE_KBPS_MAX=2500000
 
 RATE_SCALE_NUM=1535
 RATE_SCALE_DEN=1000
@@ -13,6 +17,8 @@ EIR_MAX=262143
 
 EBS_UNIT=64
 EBS_MAX=16383
+BURST_BYTES_MIN=64
+BURST_BYTES_MAX=$((EBS_MAX * EBS_UNIT))
 
 CFG_PKG="cr881x_yt921x_qos"
 CFG_FILE="/etc/config/${CFG_PKG}"
@@ -27,6 +33,34 @@ require_uinteger() {
 		return 1
 		;;
 	esac
+
+	return 0
+}
+
+is_enabled_flag() {
+	case "$1" in
+	0|1) return 0 ;;
+	esac
+
+	return 1
+}
+
+require_uinteger_range() {
+	local name="$1"
+	local value="$2"
+	local min="$3"
+	local max="$4"
+	local max_digits="${#max}"
+
+	require_uinteger "$name" "$value" || return 1
+	if [ "${#value}" -gt "$max_digits" ]; then
+		echo "error: $name too large '$value'" >&2
+		return 1
+	fi
+	if [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+		echo "error: $name out of range (${min}..${max}): $value" >&2
+		return 1
+	fi
 
 	return 0
 }
@@ -79,7 +113,7 @@ ensure_port_section() {
 		uci -q set "${CFG_PKG}.${sec}=port"
 		uci -q set "${CFG_PKG}.${sec}.port=${port}"
 		uci -q set "${CFG_PKG}.${sec}.enabled=0"
-		uci -q set "${CFG_PKG}.${sec}.rate_kbps=100000"
+		uci -q set "${CFG_PKG}.${sec}.rate_kbps=${DEFAULT_RATE_KBPS}"
 		uci -q set "${CFG_PKG}.${sec}.burst_bytes=${DEFAULT_BURST_BYTES}"
 	fi
 }
@@ -91,7 +125,7 @@ cfg_get_port_enabled() {
 
 cfg_get_port_rate() {
 	local port="$1"
-	uci -q get "${CFG_PKG}.port${port}.rate_kbps" || echo "100000"
+	uci -q get "${CFG_PKG}.port${port}.rate_kbps" || echo "$DEFAULT_RATE_KBPS"
 }
 
 cfg_get_port_burst() {
@@ -116,6 +150,22 @@ cfg_get_global_enabled() {
 	uci -q get "${CFG_PKG}.globals.enabled" || echo "1"
 }
 
+cfg_set_global_enabled() {
+	local enabled="$1"
+
+	uci -q set "${CFG_PKG}.globals=globals"
+	uci -q set "${CFG_PKG}.globals.enabled=${enabled}"
+	uci -q commit "$CFG_PKG"
+}
+
+validate_rate_kbps() {
+	require_uinteger_range rate_kbps "$1" "$RATE_KBPS_MIN" "$RATE_KBPS_MAX"
+}
+
+validate_burst_bytes() {
+	require_uinteger_range burst_bytes "$1" "$BURST_BYTES_MIN" "$BURST_BYTES_MAX"
+}
+
 rate_kbps_to_eir() {
 	local rate_kbps="$1"
 	local eir
@@ -131,8 +181,7 @@ rate_kbps_to_eir() {
 		eir="$EIR_MIN_SAFE"
 	fi
 	if [ "$eir" -gt "$EIR_MAX" ]; then
-		echo "error: requested rate too high (EIR=$eir > $EIR_MAX)" >&2
-		return 1
+		eir="$EIR_MAX"
 	fi
 
 	echo "$eir"
@@ -150,8 +199,7 @@ burst_bytes_to_ebs() {
 
 	ebs=$(( (burst_bytes + EBS_UNIT - 1) / EBS_UNIT ))
 	if [ "$ebs" -gt "$EBS_MAX" ]; then
-		echo "error: requested burst too high (EBS=$ebs > $EBS_MAX)" >&2
-		return 1
+		ebs="$EBS_MAX"
 	fi
 
 	echo "$ebs"
@@ -192,10 +240,10 @@ show_status_port() {
 	if ! require_uinteger enabled "$enabled"; then
 		enabled=0
 	fi
-	if ! require_uinteger rate_kbps "$rate_kbps"; then
-		rate_kbps=0
+	if ! validate_rate_kbps "$rate_kbps"; then
+		rate_kbps="$DEFAULT_RATE_KBPS"
 	fi
-	if ! require_uinteger burst_bytes "$burst_bytes"; then
+	if ! validate_burst_bytes "$burst_bytes"; then
 		burst_bytes="$DEFAULT_BURST_BYTES"
 	fi
 
@@ -209,17 +257,39 @@ show_status_port() {
 		burst_bytes=0
 	fi
 
-	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} (~${rate_kbps} kbps) ebs=${ebs} (~${burst_bytes} bytes)"
+	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} ebs=${ebs} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes}"
 }
 
 show_status() {
 	local port
+	local global_enabled
 
 	ensure_tools || return 1
 	ensure_config
+	global_enabled="$(cfg_get_global_enabled)"
+	if ! is_enabled_flag "$global_enabled"; then
+		global_enabled=1
+	fi
+	echo "global enabled=${global_enabled}"
 	for port in 0 1 2 3; do
 		show_status_port "$port"
 	done
+}
+
+set_global() {
+	local enabled="$1"
+
+	ensure_tools || return 1
+	ensure_config
+
+	if ! is_enabled_flag "$enabled"; then
+		echo "error: enabled must be 0 or 1" >&2
+		return 1
+	fi
+
+	cfg_set_global_enabled "$enabled"
+	apply_saved
+	echo "global enabled=${enabled}"
 }
 
 set_port() {
@@ -230,8 +300,8 @@ set_port() {
 	ensure_tools || return 1
 	ensure_config
 	require_port "$port" || return 1
-	rate_kbps_to_eir "$rate_kbps" >/dev/null || return 1
-	burst_bytes_to_ebs "$burst_bytes" >/dev/null || return 1
+	validate_rate_kbps "$rate_kbps" || return 1
+	validate_burst_bytes "$burst_bytes" || return 1
 
 	apply_port_runtime "$port" 1 "$rate_kbps" "$burst_bytes"
 	cfg_set_port "$port" 1 "$rate_kbps" "$burst_bytes"
@@ -249,10 +319,10 @@ disable_port() {
 
 	rate_kbps="$(cfg_get_port_rate "$port")"
 	burst_bytes="$(cfg_get_port_burst "$port")"
-	if ! require_uinteger rate_kbps "$rate_kbps"; then
-		rate_kbps=100000
+	if ! validate_rate_kbps "$rate_kbps"; then
+		rate_kbps="$DEFAULT_RATE_KBPS"
 	fi
-	if ! require_uinteger burst_bytes "$burst_bytes"; then
+	if ! validate_burst_bytes "$burst_bytes"; then
 		burst_bytes="$DEFAULT_BURST_BYTES"
 	fi
 
@@ -282,13 +352,13 @@ apply_saved() {
 		rate_kbps="$(cfg_get_port_rate "$port")"
 		burst_bytes="$(cfg_get_port_burst "$port")"
 
-		if ! require_uinteger enabled "$enabled"; then
+		if ! is_enabled_flag "$enabled"; then
 			enabled=0
 		fi
-		if ! require_uinteger rate_kbps "$rate_kbps"; then
-			rate_kbps=100000
+		if ! validate_rate_kbps "$rate_kbps"; then
+			rate_kbps="$DEFAULT_RATE_KBPS"
 		fi
-		if ! require_uinteger burst_bytes "$burst_bytes"; then
+		if ! validate_burst_bytes "$burst_bytes"; then
 			burst_bytes="$DEFAULT_BURST_BYTES"
 		fi
 
@@ -319,6 +389,7 @@ Commands:
   status-port <port>             Dump QoS status for one port
   set-port <port> <kbps> [burst] Set persistent per-port TBF
   disable-port <port>            Disable persistent per-port TBF
+  set-global <0|1>               Set persistent global QoS master state
   apply                          Apply saved UCI settings to tc
   get-flood-filter               Unsupported in release backend
   set-flood-filter               Unsupported in release backend
@@ -342,6 +413,10 @@ set-port)
 disable-port)
 	shift || true
 	disable_port "${1:-}"
+	;;
+set-global)
+	shift || true
+	set_global "${1:-}"
 	;;
 apply)
 	shift || true
