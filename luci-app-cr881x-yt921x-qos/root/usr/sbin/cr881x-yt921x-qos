@@ -5,6 +5,10 @@ set -eu
 PORT_MAX=3
 DEFAULT_BURST_BYTES=65536
 DEFAULT_RATE_KBPS=100000
+DEFAULT_SOFT_IFACE="br-guest"
+DEFAULT_SOFT_ENABLED=0
+DEFAULT_SOFT_RATE_KBPS=50000
+DEFAULT_SOFT_BURST_BYTES=65536
 
 RATE_KBPS_MIN=1
 RATE_KBPS_MAX=2500000
@@ -65,6 +69,19 @@ require_uinteger_range() {
 	return 0
 }
 
+require_iface_name() {
+	local ifname="$1"
+
+	case "$ifname" in
+	''|*[!A-Za-z0-9_.:-]*)
+		echo "error: invalid ifname '$ifname'" >&2
+		return 1
+		;;
+	esac
+
+	return 0
+}
+
 require_port() {
 	local port="$1"
 
@@ -75,6 +92,10 @@ require_port() {
 	fi
 
 	return 0
+}
+
+iface_exists() {
+	ip link show dev "$1" >/dev/null 2>&1
 }
 
 port_iface() {
@@ -158,6 +179,46 @@ cfg_set_global_enabled() {
 	uci -q commit "$CFG_PKG"
 }
 
+ensure_soft_section() {
+	if ! uci -q get "${CFG_PKG}.soft" >/dev/null 2>&1; then
+		uci -q set "${CFG_PKG}.soft=soft"
+		uci -q set "${CFG_PKG}.soft.ifname=${DEFAULT_SOFT_IFACE}"
+		uci -q set "${CFG_PKG}.soft.enabled=${DEFAULT_SOFT_ENABLED}"
+		uci -q set "${CFG_PKG}.soft.rate_kbps=${DEFAULT_SOFT_RATE_KBPS}"
+		uci -q set "${CFG_PKG}.soft.burst_bytes=${DEFAULT_SOFT_BURST_BYTES}"
+	fi
+}
+
+cfg_get_soft_ifname() {
+	uci -q get "${CFG_PKG}.soft.ifname" || echo "${DEFAULT_SOFT_IFACE}"
+}
+
+cfg_get_soft_enabled() {
+	uci -q get "${CFG_PKG}.soft.enabled" || echo "${DEFAULT_SOFT_ENABLED}"
+}
+
+cfg_get_soft_rate() {
+	uci -q get "${CFG_PKG}.soft.rate_kbps" || echo "${DEFAULT_SOFT_RATE_KBPS}"
+}
+
+cfg_get_soft_burst() {
+	uci -q get "${CFG_PKG}.soft.burst_bytes" || echo "${DEFAULT_SOFT_BURST_BYTES}"
+}
+
+cfg_set_soft() {
+	local ifname="$1"
+	local enabled="$2"
+	local rate_kbps="$3"
+	local burst_bytes="$4"
+
+	ensure_soft_section
+	uci -q set "${CFG_PKG}.soft.ifname=${ifname}"
+	uci -q set "${CFG_PKG}.soft.enabled=${enabled}"
+	uci -q set "${CFG_PKG}.soft.rate_kbps=${rate_kbps}"
+	uci -q set "${CFG_PKG}.soft.burst_bytes=${burst_bytes}"
+	uci -q commit "$CFG_PKG"
+}
+
 validate_rate_kbps() {
 	require_uinteger_range rate_kbps "$1" "$RATE_KBPS_MIN" "$RATE_KBPS_MAX"
 }
@@ -224,6 +285,27 @@ apply_port_runtime() {
 	fi
 }
 
+apply_soft_runtime() {
+	local ifname="$1"
+	local enabled="$2"
+	local rate_kbps="$3"
+	local burst_bytes="$4"
+
+	if [ "$enabled" -eq 1 ]; then
+		if ! iface_exists "$ifname"; then
+			echo "error: interface '$ifname' not found" >&2
+			return 1
+		fi
+
+		tc qdisc replace dev "$ifname" root tbf \
+			rate "${rate_kbps}kbit" \
+			burst "${burst_bytes}" \
+			latency 100ms >/dev/null
+	else
+		tc qdisc del dev "$ifname" root >/dev/null 2>&1 || true
+	fi
+}
+
 show_status_port() {
 	local port="$1"
 	local enabled
@@ -260,6 +342,37 @@ show_status_port() {
 	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} ebs=${ebs} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes}"
 }
 
+show_status_soft() {
+	local ifname
+	local enabled
+	local rate_kbps
+	local burst_bytes
+
+	ifname="$(cfg_get_soft_ifname)"
+	enabled="$(cfg_get_soft_enabled)"
+	rate_kbps="$(cfg_get_soft_rate)"
+	burst_bytes="$(cfg_get_soft_burst)"
+
+	if ! require_iface_name "$ifname"; then
+		ifname="$DEFAULT_SOFT_IFACE"
+	fi
+	if ! is_enabled_flag "$enabled"; then
+		enabled="$DEFAULT_SOFT_ENABLED"
+	fi
+	if ! validate_rate_kbps "$rate_kbps"; then
+		rate_kbps="$DEFAULT_SOFT_RATE_KBPS"
+	fi
+	if ! validate_burst_bytes "$burst_bytes"; then
+		burst_bytes="$DEFAULT_SOFT_BURST_BYTES"
+	fi
+	if [ "$enabled" -eq 0 ]; then
+		rate_kbps=0
+		burst_bytes=0
+	fi
+
+	echo "soft if=${ifname} en=${enabled} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes}"
+}
+
 show_status() {
 	local port
 	local global_enabled
@@ -274,6 +387,7 @@ show_status() {
 	for port in 0 1 2 3; do
 		show_status_port "$port"
 	done
+	show_status_soft
 }
 
 set_global() {
@@ -331,6 +445,32 @@ disable_port() {
 	show_status_port "$port"
 }
 
+set_soft() {
+	local ifname="$1"
+	local enabled="$2"
+	local rate_kbps="$3"
+	local burst_bytes="${4:-$DEFAULT_SOFT_BURST_BYTES}"
+
+	ensure_tools || return 1
+	ensure_config
+	require_iface_name "$ifname" || return 1
+	if ! is_enabled_flag "$enabled"; then
+		echo "error: enabled must be 0 or 1" >&2
+		return 1
+	fi
+	validate_rate_kbps "$rate_kbps" || return 1
+	validate_burst_bytes "$burst_bytes" || return 1
+
+	if [ "$enabled" -eq 1 ] && ! iface_exists "$ifname"; then
+		echo "error: interface '$ifname' not found" >&2
+		return 1
+	fi
+
+	apply_soft_runtime "$ifname" "$enabled" "$rate_kbps" "$burst_bytes"
+	cfg_set_soft "$ifname" "$enabled" "$rate_kbps" "$burst_bytes"
+	show_status_soft
+}
+
 apply_saved() {
 	local port
 	local enabled
@@ -368,6 +508,35 @@ apply_saved() {
 			apply_port_runtime "$port" 0 0 0 || true
 		fi
 	done
+
+	local soft_ifname
+	local soft_enabled
+	local soft_rate_kbps
+	local soft_burst_bytes
+
+	soft_ifname="$(cfg_get_soft_ifname)"
+	soft_enabled="$(cfg_get_soft_enabled)"
+	soft_rate_kbps="$(cfg_get_soft_rate)"
+	soft_burst_bytes="$(cfg_get_soft_burst)"
+
+	if ! require_iface_name "$soft_ifname"; then
+		soft_ifname="$DEFAULT_SOFT_IFACE"
+	fi
+	if ! is_enabled_flag "$soft_enabled"; then
+		soft_enabled="$DEFAULT_SOFT_ENABLED"
+	fi
+	if ! validate_rate_kbps "$soft_rate_kbps"; then
+		soft_rate_kbps="$DEFAULT_SOFT_RATE_KBPS"
+	fi
+	if ! validate_burst_bytes "$soft_burst_bytes"; then
+		soft_burst_bytes="$DEFAULT_SOFT_BURST_BYTES"
+	fi
+
+	if [ "$soft_enabled" -eq 1 ]; then
+		apply_soft_runtime "$soft_ifname" 1 "$soft_rate_kbps" "$soft_burst_bytes" || true
+	else
+		apply_soft_runtime "$soft_ifname" 0 0 0 || true
+	fi
 }
 
 get_flood_filter() {
@@ -390,6 +559,9 @@ Commands:
   set-port <port> <kbps> [burst] Set persistent per-port TBF
   disable-port <port>            Disable persistent per-port TBF
   set-global <0|1>               Set persistent global QoS master state
+  set-soft <if> <0|1> <kbps> [burst]
+                                Set persistent software TBF on interface
+  status-soft                    Dump software TBF status
   apply                          Apply saved UCI settings to tc
   get-flood-filter               Unsupported in release backend
   set-flood-filter               Unsupported in release backend
@@ -417,6 +589,14 @@ disable-port)
 set-global)
 	shift || true
 	set_global "${1:-}"
+	;;
+set-soft)
+	shift || true
+	set_soft "${1:-}" "${2:-}" "${3:-}" "${4:-$DEFAULT_SOFT_BURST_BYTES}"
+	;;
+status-soft)
+	shift || true
+	show_status_soft "$@"
 	;;
 apply)
 	shift || true

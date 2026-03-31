@@ -57,6 +57,13 @@ const callSetGlobal = rpc.declare({
 	expect: {}
 });
 
+const callSetSoft = rpc.declare({
+	object: 'luci.cr881x_yt921x_qos',
+	method: 'set_soft',
+	params: [ 'ifname', 'enable', 'rate_kbps', 'burst_bytes' ],
+	expect: {}
+});
+
 const callGetFloodFilter = rpc.declare({
 	object: 'luci.cr881x_yt921x_qos',
 	method: 'get_flood_filter',
@@ -784,6 +791,34 @@ return view.extend({
 			class: 'cbi-button cbi-button-apply',
 			title: _('Apply global QoS enable state')
 		}, [ _('Apply') ]);
+		const softStateNow = E('code', {}, [ '-' ]);
+		const softEnable = E('input', { type: 'checkbox' });
+		const softIface = E('select', { class: 'cbi-input-select' }, [
+			E('option', { value: 'br-guest' }, [ 'br-guest' ]),
+			E('option', { value: 'wlan0-1' }, [ 'wlan0-1' ]),
+			E('option', { value: 'wlan1-1' }, [ 'wlan1-1' ])
+		]);
+		const softRateInput = E('input', {
+			type: 'text',
+			inputmode: 'numeric',
+			pattern: '[0-9]*',
+			maxlength: '7',
+			class: 'cbi-input-text crq-num-input',
+			title: _('Software QoS rate in kbps')
+		});
+		const softBurstInput = E('input', {
+			type: 'text',
+			inputmode: 'numeric',
+			pattern: '[0-9]*',
+			maxlength: '7',
+			class: 'cbi-input-text crq-num-input',
+			title: _('Software QoS burst in bytes')
+		});
+		const softApplyBtn = E('button', {
+			type: 'button',
+			class: 'cbi-button cbi-button-apply',
+			title: _('Apply software QoS settings')
+		}, [ _('Apply Wi-Fi/Guest QoS') ]);
 
 		const applyFloodState = function(next) {
 			if (!floodSupported) {
@@ -823,6 +858,18 @@ return view.extend({
 			metricAvg.set(fmt_rate_short(avgRate), avgRate + ' kbps');
 			metricBackend.set(helper_path_node(info.helper || '/usr/sbin/cr881x-yt921x-qos'));
 			globalEnable.checked = !!globalEnabled;
+
+			const soft = st.soft || {};
+			const softEnabled = +soft.en ? 1 : 0;
+			const softIfname = soft.ifname || 'br-guest';
+			const softRate = (soft.rate_kbps != null) ? Math.max(RATE_KBPS_MIN, Math.round(+soft.rate_kbps || 0)) : 50000;
+			const softBurst = (soft.burst_bytes != null) ? Math.max(BURST_BYTES_MIN, Math.round(+soft.burst_bytes || 0)) : DEFAULT_BURST_BYTES;
+
+			softEnable.checked = !!softEnabled;
+			softIface.value = softIfname;
+			softRateInput.value = String(softRate);
+			softBurstInput.value = String(softBurst);
+			softStateNow.textContent = (softEnabled ? _('Enabled') : _('Disabled')) + ' @ ' + softIfname;
 
 			portsWrap.innerHTML = '';
 			for (let port = 0; port < numPorts; port++)
@@ -882,6 +929,24 @@ return view.extend({
 				if (!res || !res.ok) {
 					ui.addNotification(null,
 						E('p', {}, [ (res && (res.error || res.output)) || _('Failed to apply global QoS setting.') ]),
+						'error');
+				}
+
+				if (res && res.status) {
+					currentStatus = res.status;
+					applyStatusState(currentStatus);
+					return;
+				}
+
+				return refreshState();
+			});
+		};
+
+		const applySoft = function(ifname, enable, rate, burst) {
+			return L.resolveDefault(callSetSoft(ifname, enable, rate, burst), {}).then(function(res) {
+				if (!res || !res.ok) {
+					ui.addNotification(null,
+						E('p', {}, [ (res && (res.error || res.output)) || _('Failed to apply Wi-Fi/Guest QoS settings.') ]),
 						'error');
 				}
 
@@ -1028,6 +1093,35 @@ return view.extend({
 			refreshState();
 		});
 
+		softApplyBtn.addEventListener('click', function(ev) {
+			ev.preventDefault();
+
+			const ifname = String(softIface.value || '').trim();
+			const enable = softEnable.checked ? 1 : 0;
+			const rate = parse_uint_bounded(softRateInput.value, 50000, RATE_KBPS_MIN, RATE_KBPS_MAX, 7);
+			const burst = parse_uint_bounded(softBurstInput.value, DEFAULT_BURST_BYTES, BURST_BYTES_MIN, BURST_BYTES_MAX, 7);
+
+			if (!ifname) {
+				ui.addNotification(null, E('p', {}, [ _('Target interface is required.') ]), 'error');
+				return;
+			}
+
+			if (enable && rate == null) {
+				ui.addNotification(null, E('p', {}, [ _('Rate must be numeric and in valid range.') ]), 'error');
+				return;
+			}
+
+			if (enable && burst == null) {
+				ui.addNotification(null, E('p', {}, [ _('Burst must be numeric and in valid range.') ]), 'error');
+				return;
+			}
+
+			softApplyBtn.disabled = true;
+			Promise.resolve(applySoft(ifname, enable, rate, burst)).finally(function() {
+				softApplyBtn.disabled = false;
+			});
+		});
+
 		floodMaskInput.addEventListener('blur', function() {
 			const parsedMask = parse_mask_input(floodMaskInput.value);
 			floodMaskInput.value = fmt_mask_hex(parsedMask == null ? FILTER_SAFE_DEFAULT : parsedMask);
@@ -1130,54 +1224,44 @@ return view.extend({
 			E('details', {}, [
 				E('summary', {
 					style: 'cursor:pointer;font-weight:700;'
-				}, [ _('Wi-Fi / Guest QoS (Draft)') ]),
+				}, [ _('Wi-Fi / Guest QoS (Software TBF)') ]),
 				E('div', { class: 'crq-help', style: 'margin-top:8px;' }, [
-					_('UI draft only. Not wired yet.'),
+					_('Software shaping on selected Wi-Fi/guest interface.'),
 					' ',
-					_('Planned for software QoS on wlan/br-guest interfaces.')
+					_('Uses tc tbf and is independent from switch offload queues.')
 				]),
-				E('fieldset', { class: 'crq-draft-muted', disabled: 'disabled' }, [
-					E('div', { class: 'crq-draft-grid' }, [
-						E('div', { class: 'crq-field' }, [
-							E('label', {}, [ _('Target interface') ]),
-							E('select', { class: 'cbi-input-select' }, [
-								E('option', {}, [ 'br-guest' ]),
-								E('option', {}, [ 'wlan0-1' ]),
-								E('option', {}, [ 'wlan1-1' ])
-							])
-						]),
-						E('div', { class: 'crq-field' }, [
-							E('label', {}, [ _('Mode') ]),
-							E('select', { class: 'cbi-input-select' }, [
-								E('option', {}, [ _('Balanced') ]),
-								E('option', {}, [ _('Low latency') ]),
-								E('option', {}, [ _('Bulk limit') ])
-							])
-						]),
-						E('div', { class: 'crq-field' }, [
-							E('label', {}, [ _('Upload cap (Mbps)') ]),
-							E('input', {
-								type: 'number',
-								class: 'cbi-input-text',
-								value: '50'
-							})
-						]),
-						E('div', { class: 'crq-field' }, [
-							E('label', {}, [ _('Download cap (Mbps)') ]),
-							E('input', {
-								type: 'number',
-								class: 'cbi-input-text',
-								value: '100'
-							})
+				E('div', { class: 'crq-inline', style: 'margin-top:8px;' }, [
+					E('span', {}, [ _('Current:'), ' ', softStateNow ])
+				]),
+				E('div', { class: 'crq-draft-grid' }, [
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Target interface') ]),
+						softIface
+					]),
+					E('div', { class: 'crq-field' }, [
+						E('label', {
+							style: 'display:flex;align-items:center;gap:6px;cursor:pointer;'
+						}, [
+							softEnable,
+							E('span', {}, [ _('Enable software shaper') ])
 						])
 					]),
-					E('div', { class: 'crq-actions' }, [
-						E('button', {
-							type: 'button',
-							class: 'cbi-button cbi-button-apply',
-							disabled: 'disabled'
-						}, [ _('Apply (coming soon)') ])
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Rate (kbps)') ]),
+						softRateInput
+					]),
+					E('div', { class: 'crq-field' }, [
+						E('label', {}, [ _('Burst (bytes)') ]),
+						softBurstInput
 					])
+				]),
+				E('div', { class: 'crq-help' }, [
+					_('Rate: ') + RATE_KBPS_MIN + '..' + RATE_KBPS_MAX + ' kbps',
+					' | ',
+					_('Burst: ') + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ' bytes'
+				]),
+				E('div', { class: 'crq-actions' }, [
+					softApplyBtn
 				])
 			])
 		]);

@@ -7,6 +7,10 @@ import { access, popen } from 'fs';
 const helper = '/usr/sbin/cr881x-yt921x-qos';
 const port_max = 3;
 const default_burst_bytes = 65536;
+const default_soft_iface = 'br-guest';
+const default_soft_enabled = 0;
+const default_soft_rate_kbps = 50000;
+const default_soft_burst_bytes = 65536;
 const filter_mask_max = 0x7ff;
 const rate_kbps_min = 1;
 const rate_kbps_max = 2500000;
@@ -105,9 +109,52 @@ function parse_tbf_line(line) {
 	return item;
 }
 
+function parse_soft_line(line) {
+	line = trim(line);
+	if (!line || index(line, 'soft ') != 0)
+		return null;
+
+	let tail = trim(substr(line, 5));
+	let item = {
+		ifname: default_soft_iface,
+		en: default_soft_enabled,
+		rate_kbps: 0,
+		burst_bytes: 0,
+		raw: line
+	};
+
+	let fields = split(tail, ' ');
+	for (let i = 0; i < length(fields); i++) {
+		let f = fields[i];
+		let eq = index(f, '=');
+		if (eq <= 0)
+			continue;
+
+		let k = substr(f, 0, eq);
+		let v = substr(f, eq + 1);
+
+		if (k == 'if')
+			item.ifname = v || default_soft_iface;
+		else if (k == 'en')
+			item.en = int(+v);
+		else if (k == 'rate_kbps')
+			item.rate_kbps = int(+v);
+		else if (k == 'burst_bytes')
+			item.burst_bytes = int(+v);
+	}
+
+	return item;
+}
+
 function parse_status_output(output) {
 	let ports = [];
 	let global_enabled = 1;
+	let soft = {
+		ifname: default_soft_iface,
+		en: default_soft_enabled,
+		rate_kbps: 0,
+		burst_bytes: 0
+	};
 	let lines = split(output, '\n');
 
 	for (let i = 0; i < length(lines); i++) {
@@ -120,13 +167,20 @@ function parse_status_output(output) {
 		}
 
 		let p = parse_tbf_line(lines[i]);
-		if (p != null)
+		if (p != null) {
 			ports[length(ports)] = p;
+			continue;
+		}
+
+		let s = parse_soft_line(lines[i]);
+		if (s != null)
+			soft = s;
 	}
 
 	return {
 		global_enabled,
-		ports
+		ports,
+		soft
 	};
 }
 
@@ -148,7 +202,8 @@ function status_call() {
 		error: (res.code == 0) ? '' : (res.output || 'status failed'),
 		output: res.output,
 		global_enabled: parsed.global_enabled,
-		ports: parsed.ports
+		ports: parsed.ports,
+		soft: parsed.soft
 	};
 }
 
@@ -189,6 +244,15 @@ function parse_bool01(v, fallback) {
 		return int(+v);
 
 	return null;
+}
+
+function parse_ifname(v, fallback) {
+	const s = trim(`${v ?? ''}`);
+	if (!s)
+		return fallback;
+	if (match(s, /[^A-Za-z0-9_.:-]/))
+		return null;
+	return s;
 }
 
 function parse_flood_output(output) {
@@ -258,6 +322,7 @@ function get_info_call() {
 		features: {
 			persistent: true,
 			port_tbf: true,
+			soft_tbf: true,
 			flood_filter: false
 		}
 	};
@@ -419,6 +484,64 @@ function set_flood_filter_call(args) {
 	};
 }
 
+function set_soft_call(args) {
+	if (!access(helper, 'x')) {
+		return {
+			ok: false,
+			code: 127,
+			error: `${helper} is missing`
+		};
+	}
+
+	const ifname = parse_ifname(args?.ifname, default_soft_iface);
+	const enable = parse_bool01(args?.enable, null);
+	const rate_kbps = parse_uint_bounded(args?.rate_kbps, default_soft_rate_kbps, rate_kbps_min, rate_kbps_max, 7);
+	const burst_bytes = parse_uint_bounded(args?.burst_bytes, default_soft_burst_bytes, burst_bytes_min, burst_bytes_max, 7);
+
+	if (ifname == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'invalid interface name'
+		};
+	}
+
+	if (enable == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'enable must be 0 or 1'
+		};
+	}
+
+	if (enable && rate_kbps == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: `rate_kbps must be ${rate_kbps_min}..${rate_kbps_max} when enabled`
+		};
+	}
+
+	if (enable && burst_bytes == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: `burst_bytes must be ${burst_bytes_min}..${burst_bytes_max} when enabled`
+		};
+	}
+
+	const res = run_helper([ 'set-soft', ifname, `${enable}`, `${rate_kbps}`, `${burst_bytes}` ]);
+	const st = status_call();
+
+	return {
+		ok: (res.code == 0),
+		code: res.code,
+		error: (res.code == 0) ? '' : (res.output || 'set_soft failed'),
+		output: res.output,
+		status: st
+	};
+}
+
 const methods = {
 	get_info: {
 		call: function() {
@@ -467,6 +590,18 @@ const methods = {
 		},
 		call: function(req) {
 			return set_flood_filter_call(req?.args || {});
+		}
+	},
+
+	set_soft: {
+		args: {
+			ifname: 'ifname',
+			enable: 'enable',
+			rate_kbps: 'rate_kbps',
+			burst_bytes: 'burst_bytes'
+		},
+		call: function(req) {
+			return set_soft_call(req?.args || {});
 		}
 	}
 };

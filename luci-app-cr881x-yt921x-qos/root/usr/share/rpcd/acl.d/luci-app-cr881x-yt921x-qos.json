@@ -8,7 +8,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.cr881x_yt921x_qos": [ "set_port", "set_flood_filter" ]
+				"luci.cr881x_yt921x_qos": [ "set_port", "set_global", "set_soft", "set_flood_filter" ]
 			}
 		}
 	}
