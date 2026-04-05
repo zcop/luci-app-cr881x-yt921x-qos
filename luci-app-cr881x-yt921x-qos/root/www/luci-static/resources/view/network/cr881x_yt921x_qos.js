@@ -9,9 +9,6 @@ const RATE_KBPS_MIN = 1;
 const RATE_KBPS_MAX = 2500000;
 const BURST_BYTES_MIN = 64;
 const BURST_BYTES_MAX = 1048512;
-const FILTER_MASK_MAX = 0x7ff;
-const FILTER_MASK_DANGEROUS = 0x7ff;
-const FILTER_SAFE_DEFAULT = 0x400;
 const STYLE_ID = 'cr881x-yt921x-qos-style';
 
 function port_label(port) {
@@ -46,7 +43,7 @@ const callStatus = rpc.declare({
 const callSetPort = rpc.declare({
 	object: 'luci.cr881x_yt921x_qos',
 	method: 'set_port',
-	params: [ 'port', 'enable', 'rate_kbps', 'burst_bytes' ],
+	params: [ 'port', 'enable', 'rate_kbps', 'burst_bytes', 'mcast_flood', 'bcast_flood' ],
 	expect: {}
 });
 
@@ -61,19 +58,6 @@ const callSetSoft = rpc.declare({
 	object: 'luci.cr881x_yt921x_qos',
 	method: 'set_soft',
 	params: [ 'ifname', 'enable', 'rate_kbps', 'burst_bytes' ],
-	expect: {}
-});
-
-const callGetFloodFilter = rpc.declare({
-	object: 'luci.cr881x_yt921x_qos',
-	method: 'get_flood_filter',
-	expect: {}
-});
-
-const callSetFloodFilter = rpc.declare({
-	object: 'luci.cr881x_yt921x_qos',
-	method: 'set_flood_filter',
-	params: [ 'target', 'mask', 'force' ],
 	expect: {}
 });
 
@@ -454,31 +438,6 @@ function parse_uint_bounded(v, min, max, maxDigits) {
 	return n;
 }
 
-function parse_mask_input(v) {
-	const s = String(v == null ? '' : v).trim();
-	let n = NaN;
-
-	if (/^0x[0-9a-f]+$/i.test(s))
-		n = parseInt(s, 16);
-	else if (/^[0-9]+$/.test(s))
-		n = parseInt(s, 10);
-
-	if (!Number.isInteger(n) || n < 0 || n > FILTER_MASK_MAX)
-		return null;
-
-	return n;
-}
-
-function fmt_mask_hex(v) {
-	if (v == null || v < 0)
-		return '-';
-
-	let s = Number(v).toString(16);
-	while (s.length < 3)
-		s = '0' + s;
-	return '0x' + s;
-}
-
 function fmt_rate_short(kbps) {
 	const n = Math.max(0, Math.round(+kbps || 0));
 	if (n >= 1000000)
@@ -541,10 +500,13 @@ function make_metric(title, hint) {
 	};
 }
 
-function port_card(port, st, apply_cb) {
+function port_card(port, st, apply_cb, opts) {
 	const enabled = !!(+st.en);
 	const liveRate = Math.round(+st.rate_kbps || 0);
 	const liveBurst = parse_int(st.burst_bytes, DEFAULT_BURST_BYTES);
+	const mcastFlood = (st.mcast_flood == null) ? 1 : (+st.mcast_flood ? 1 : 0);
+	const bcastFlood = (st.bcast_flood == null) ? 1 : (+st.bcast_flood ? 1 : 0);
+	const floodSupported = !!(opts && opts.portFloodSupported);
 	const rateInput = E('input', {
 		type: 'text',
 		inputmode: 'numeric',
@@ -562,6 +524,8 @@ function port_card(port, st, apply_cb) {
 		title: _('Burst size in bytes') + ' (' + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ')'
 	});
 	const enBox = E('input', { type: 'checkbox' });
+	const mcastFloodBox = E('input', { type: 'checkbox' });
+	const bcastFloodBox = E('input', { type: 'checkbox' });
 	const applyBtn = E('button', {
 		type: 'button',
 		class: 'cbi-button cbi-button-apply',
@@ -571,6 +535,10 @@ function port_card(port, st, apply_cb) {
 	rateInput.value = String(Math.max(1, liveRate || 100000));
 	burstInput.value = String(Math.max(64, liveBurst || DEFAULT_BURST_BYTES));
 	enBox.checked = enabled;
+	mcastFloodBox.checked = !!mcastFlood;
+	bcastFloodBox.checked = !!bcastFlood;
+	mcastFloodBox.disabled = !floodSupported;
+	bcastFloodBox.disabled = !floodSupported;
 
 	function sanitize_digits_input(input, maxDigits) {
 		let v = String(input.value == null ? '' : input.value).replace(/[^0-9]/g, '');
@@ -620,6 +588,8 @@ function port_card(port, st, apply_cb) {
 		const enable = enBox.checked ? 1 : 0;
 		const rate = parse_uint_bounded(rateInput.value, RATE_KBPS_MIN, RATE_KBPS_MAX, 7);
 		const burst = parse_uint_bounded(burstInput.value, BURST_BYTES_MIN, BURST_BYTES_MAX, 7);
+		const mcast = floodSupported ? (mcastFloodBox.checked ? 1 : 0) : 1;
+		const bcast = floodSupported ? (bcastFloodBox.checked ? 1 : 0) : 1;
 
 		if (enable && rate == null) {
 			ui.addNotification(null, E('p', {}, [
@@ -636,7 +606,7 @@ function port_card(port, st, apply_cb) {
 		}
 
 		applyBtn.disabled = true;
-		Promise.resolve(apply_cb(port, enable, rate, burst)).finally(function() {
+		Promise.resolve(apply_cb(port, enable, rate, burst, mcast, bcast)).finally(function() {
 			applyBtn.disabled = false;
 		});
 	}
@@ -695,15 +665,24 @@ function port_card(port, st, apply_cb) {
 							E('label', {}, [ _('Rate (kbps)') ]),
 							rateInput
 						]),
-					E('div', { class: 'crq-field-row' }, [
-						E('label', {}, [ _('Burst (bytes)') ]),
+						E('div', { class: 'crq-field-row' }, [
+							E('label', {}, [ _('Burst (bytes)') ]),
 							burstInput
+						]),
+						E('div', { class: 'crq-field-row' }, [
+							E('label', {}, [ _('Allow multicast flood') ]),
+							mcastFloodBox
+						]),
+						E('div', { class: 'crq-field-row' }, [
+							E('label', {}, [ _('Allow broadcast flood') ]),
+							bcastFloodBox
 						])
 					]),
 					E('div', { class: 'crq-help', style: 'margin-top:6px;' }, [
 						_('Rate: ') + RATE_KBPS_MIN + '..' + RATE_KBPS_MAX + ' kbps',
 						' | ',
-						_('Burst: ') + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ' bytes'
+						_('Burst: ') + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ' bytes',
+						floodSupported ? '' : (' | ' + _('Flood controls unavailable in backend'))
 					])
 				]),
 				E('div', {}, [
@@ -717,15 +696,10 @@ function port_card(port, st, apply_cb) {
 
 return view.extend({
 	load: function() {
-		return L.resolveDefault(callInfo(), {}).then(function(info) {
-			const flood = !!(info && info.features && info.features.flood_filter);
-
-			return Promise.all([
-				info || {},
-				L.resolveDefault(callStatus(), {}),
-				flood ? L.resolveDefault(callGetFloodFilter(), {}) : Promise.resolve({})
-			]);
-		});
+		return Promise.all([
+			L.resolveDefault(callInfo(), {}),
+			L.resolveDefault(callStatus(), {})
+		]);
 	},
 
 	render: function(data) {
@@ -733,12 +707,11 @@ return view.extend({
 
 		const info = data[0] || {};
 		const features = info.features || {};
-		const floodSupported = !!features.flood_filter;
+		const portFloodSupported = !!features.port_flood_flags;
 		const persistentSupported = !!features.persistent;
 		const portMax = parse_int(info.port_max, NUM_PORTS - 1);
 		const numPorts = Math.max(1, portMax + 1);
 		let currentStatus = data[1] || {};
-		let currentFlood = floodSupported ? (data[2] || {}) : {};
 
 		const refreshBtn = E('button', {
 			type: 'button',
@@ -750,7 +723,7 @@ return view.extend({
 		const metricPorts = make_metric(_('Ports enabled'), _('of ') + numPorts);
 		const metricPeak = make_metric(_('Peak rate'), _('Highest active shaper'));
 		const metricAvg = make_metric(_('Average rate'), _('Across enabled ports'));
-		const metricFlood = make_metric(_('Flood mask'), _('Multicast / Broadcast'));
+		const metricFlood = make_metric(_('Flood forwarding'), _('Per-port mcast / bcast'));
 		const metricBackend = make_metric(_('Backend helper'), '');
 
 		const summaryWrap = E('div', { class: 'crq-metrics' }, [
@@ -762,28 +735,6 @@ return view.extend({
 		]);
 
 		const portsWrap = E('div', { class: 'crq-port-grid' });
-		const floodMcastNow = E('code', {}, [ '-' ]);
-		const floodBcastNow = E('code', {}, [ '-' ]);
-		const floodTarget = E('select', { class: 'cbi-input-select' }, [
-			E('option', { value: 'both' }, [ _('Both (mcast+bcast)') ]),
-			E('option', { value: 'mcast' }, [ _('Multicast only') ]),
-			E('option', { value: 'bcast' }, [ _('Broadcast only') ])
-		]);
-		const floodMaskInput = E('input', {
-			class: 'cbi-input-text',
-			type: 'text',
-			style: 'width: 10em;',
-			placeholder: '0x400',
-			title: _('Flood filter mask (decimal or hex 0..0x7ff)')
-		});
-		floodMaskInput.value = fmt_mask_hex(FILTER_SAFE_DEFAULT);
-
-		const floodForce = E('input', { type: 'checkbox' });
-		const floodApplyBtn = E('button', {
-			type: 'button',
-			class: 'cbi-button cbi-button-apply',
-			title: _('Apply flood filter mask')
-		}, [ _('Apply filter mask') ]);
 
 		const globalEnable = E('input', { type: 'checkbox' });
 		const globalApplyBtn = E('button', {
@@ -820,34 +771,28 @@ return view.extend({
 			title: _('Apply software QoS settings')
 		}, [ _('Apply Wi-Fi/Guest QoS') ]);
 
-		const applyFloodState = function(next) {
-			if (!floodSupported) {
-				floodMcastNow.textContent = '-';
-				floodBcastNow.textContent = '-';
-				metricFlood.set(_('N/A'), _('Unsupported by current backend'));
-				return;
-			}
-
-			const mcast = (next && next.mcast != null) ? +next.mcast : null;
-			const bcast = (next && next.bcast != null) ? +next.bcast : null;
-
-			floodMcastNow.textContent = (mcast == null) ? '-' : (fmt_mask_hex(mcast) + ' (' + mcast + ')');
-			floodBcastNow.textContent = (bcast == null) ? '-' : (fmt_mask_hex(bcast) + ' (' + bcast + ')');
-			metricFlood.set('M ' + floodMcastNow.textContent + ' / B ' + floodBcastNow.textContent);
-		};
-
 		const applyStatusState = function(st) {
 			const ports = st.ports || [];
 			const byPort = status_map_by_port(ports, numPorts);
 			const globalEnabled = +st.global_enabled ? 1 : 0;
 			let enabledCount = 0;
 			let activeRates = [];
+			let mcastAllowed = 0;
+			let bcastAllowed = 0;
 
 			for (let i = 0; i < ports.length; i++) {
-				if (ports[i] && +ports[i].port < numPorts && +ports[i].en) {
+				if (!ports[i] || +ports[i].port >= numPorts)
+					continue;
+
+				if (+ports[i].en) {
 					enabledCount++;
 					activeRates.push(Math.round(+ports[i].rate_kbps || 0));
 				}
+
+				if (+ports[i].mcast_flood)
+					mcastAllowed++;
+				if (+ports[i].bcast_flood)
+					bcastAllowed++;
 			}
 
 			const peakRate = activeRates.length ? Math.max.apply(null, activeRates) : 0;
@@ -856,6 +801,10 @@ return view.extend({
 			metricPorts.set(String(enabledCount), _('of ') + numPorts);
 			metricPeak.set(fmt_rate_short(peakRate), peakRate + ' kbps');
 			metricAvg.set(fmt_rate_short(avgRate), avgRate + ' kbps');
+			if (portFloodSupported)
+				metricFlood.set('M ' + mcastAllowed + '/' + numPorts + ' | B ' + bcastAllowed + '/' + numPorts);
+			else
+				metricFlood.set(_('N/A'), _('Unsupported by current backend'));
 			metricBackend.set(helper_path_node(info.helper || '/usr/sbin/cr881x-yt921x-qos'));
 			globalEnable.checked = !!globalEnabled;
 
@@ -873,19 +822,16 @@ return view.extend({
 
 			portsWrap.innerHTML = '';
 			for (let port = 0; port < numPorts; port++)
-				portsWrap.appendChild(port_card(port, byPort[port] || {}, applyPort));
+				portsWrap.appendChild(port_card(port, byPort[port] || {}, applyPort, {
+					portFloodSupported: portFloodSupported
+				}));
 
 			updatedNode.textContent = _('Last refresh: ') + new Date().toLocaleTimeString();
 		};
 
 		const refreshState = function() {
-			const req = [ L.resolveDefault(callStatus(), {}) ];
-			if (floodSupported)
-				req.push(L.resolveDefault(callGetFloodFilter(), {}));
-
-			return Promise.all(req).then(function(next) {
+			return Promise.all([ L.resolveDefault(callStatus(), {}) ]).then(function(next) {
 				const nextStatus = next[0] || {};
-				const nextFlood = floodSupported ? (next[1] || {}) : {};
 
 				if (!nextStatus || !nextStatus.ok) {
 					ui.addNotification(null,
@@ -893,21 +839,20 @@ return view.extend({
 						'error');
 				}
 
-				if (floodSupported && (!nextFlood || !nextFlood.ok)) {
-					ui.addNotification(null,
-						E('p', {}, [ (nextFlood && (nextFlood.error || nextFlood.output)) || _('Failed to refresh flood filter state.') ]),
-						'error');
-				}
-
 				currentStatus = nextStatus;
-				currentFlood = nextFlood;
-				applyFloodState(currentFlood);
 				applyStatusState(currentStatus);
 			});
 		};
 
-		const applyPort = function(port, enable, rate, burst) {
-			return L.resolveDefault(callSetPort(port, enable, rate, burst), {}).then(function(res) {
+		const applyPort = function(port, enable, rate, burst, mcastFlood, bcastFlood) {
+			return L.resolveDefault(callSetPort(
+				port,
+				enable,
+				rate,
+				burst,
+				portFloodSupported ? mcastFlood : 1,
+				portFloodSupported ? bcastFlood : 1
+			), {}).then(function(res) {
 				if (!res || !res.ok) {
 					ui.addNotification(null,
 						E('p', {}, [ (res && (res.error || res.output)) || _('Failed to apply port setting.') ]),
@@ -960,28 +905,13 @@ return view.extend({
 			});
 		};
 
-		const applyFlood = function(target, mask, force) {
-			if (!floodSupported)
-				return Promise.resolve();
-
-			return L.resolveDefault(callSetFloodFilter(target, mask, force), {}).then(function(res) {
-				if (!res || !res.ok) {
-					ui.addNotification(null,
-						E('p', {}, [ (res && (res.error || res.output)) || _('Failed to apply flood filter.') ]),
-						'error');
-				}
-
-				return refreshState();
-			});
-		};
-
 		const runBulk = function(entries) {
 			let chain = Promise.resolve();
 
 			for (let i = 0; i < entries.length; i++) {
 				const e = entries[i];
 				chain = chain.then(function() {
-					return applyPort(e.port, e.enable, e.rate, e.burst);
+					return applyPort(e.port, e.enable, e.rate, e.burst, e.mcast_flood, e.bcast_flood);
 				});
 			}
 
@@ -1001,8 +931,18 @@ return view.extend({
 			disableAllBtn.disabled = true;
 
 			const entries = [];
-			for (let p = 0; p < numPorts; p++)
-				entries.push({ port: p, enable: 0, rate: 0, burst: DEFAULT_BURST_BYTES });
+			const byPort = status_map_by_port((currentStatus && currentStatus.ports) || [], numPorts);
+			for (let p = 0; p < numPorts; p++) {
+				const ps = byPort[p] || {};
+				entries.push({
+					port: p,
+					enable: 0,
+					rate: 0,
+					burst: DEFAULT_BURST_BYTES,
+					mcast_flood: (ps.mcast_flood == null) ? 1 : (+ps.mcast_flood ? 1 : 0),
+					bcast_flood: (ps.bcast_flood == null) ? 1 : (+ps.bcast_flood ? 1 : 0)
+				});
+			}
 
 			runBulk(entries).finally(function() {
 				disableAllBtn.disabled = false;
@@ -1020,8 +960,18 @@ return view.extend({
 			lan100Btn.disabled = true;
 
 			const entries = [];
-			for (let p = 0; p < Math.min(3, numPorts); p++)
-				entries.push({ port: p, enable: 1, rate: 100000, burst: DEFAULT_BURST_BYTES });
+			const byPort = status_map_by_port((currentStatus && currentStatus.ports) || [], numPorts);
+			for (let p = 0; p < Math.min(3, numPorts); p++) {
+				const ps = byPort[p] || {};
+				entries.push({
+					port: p,
+					enable: 1,
+					rate: 100000,
+					burst: DEFAULT_BURST_BYTES,
+					mcast_flood: (ps.mcast_flood == null) ? 1 : (+ps.mcast_flood ? 1 : 0),
+					bcast_flood: (ps.bcast_flood == null) ? 1 : (+ps.bcast_flood ? 1 : 0)
+				});
+			}
 
 			runBulk(entries).finally(function() {
 				lan100Btn.disabled = false;
@@ -1041,7 +991,9 @@ return view.extend({
 				port: Math.min(3, numPorts - 1),
 				enable: 1,
 				rate: 300000,
-				burst: DEFAULT_BURST_BYTES
+				burst: DEFAULT_BURST_BYTES,
+				mcast_flood: 1,
+				bcast_flood: 1
 			}]).finally(function() {
 				wan300Btn.disabled = false;
 			});
@@ -1050,7 +1002,7 @@ return view.extend({
 		const resetSafeBtn = E('button', {
 			type: 'button',
 			class: 'cbi-button cbi-button-neutral crq-btn-block',
-			title: _('Enable global QoS, disable all shapers, and set safe flood mask')
+			title: _('Enable global QoS and disable all shapers')
 		}, [ _('Reset safe defaults') ]);
 
 		resetSafeBtn.addEventListener('click', function(ev) {
@@ -1060,20 +1012,22 @@ return view.extend({
 
 			resetSafeBtn.disabled = true;
 			const entries = [];
-			for (let p = 0; p < numPorts; p++)
-				entries.push({ port: p, enable: 0, rate: 0, burst: DEFAULT_BURST_BYTES });
-
-			let chain = Promise.resolve(applyGlobal(1)).then(function() {
-				return runBulk(entries);
-			});
-
-			if (floodSupported) {
-				chain = chain.then(function() {
-					return applyFlood('both', fmt_mask_hex(FILTER_SAFE_DEFAULT), 0);
+			const byPort = status_map_by_port((currentStatus && currentStatus.ports) || [], numPorts);
+			for (let p = 0; p < numPorts; p++) {
+				const ps = byPort[p] || {};
+				entries.push({
+					port: p,
+					enable: 0,
+					rate: 0,
+					burst: DEFAULT_BURST_BYTES,
+					mcast_flood: (ps.mcast_flood == null) ? 1 : (+ps.mcast_flood ? 1 : 0),
+					bcast_flood: (ps.bcast_flood == null) ? 1 : (+ps.bcast_flood ? 1 : 0)
 				});
 			}
 
-			chain.then(function() {
+			Promise.resolve(applyGlobal(1)).then(function() {
+				return runBulk(entries);
+			}).then(function() {
 				return refreshState();
 			}).finally(function() {
 				resetSafeBtn.disabled = false;
@@ -1098,8 +1052,8 @@ return view.extend({
 
 			const ifname = String(softIface.value || '').trim();
 			const enable = softEnable.checked ? 1 : 0;
-			const rate = parse_uint_bounded(softRateInput.value, 50000, RATE_KBPS_MIN, RATE_KBPS_MAX, 7);
-			const burst = parse_uint_bounded(softBurstInput.value, DEFAULT_BURST_BYTES, BURST_BYTES_MIN, BURST_BYTES_MAX, 7);
+			const rate = parse_uint_bounded(softRateInput.value, RATE_KBPS_MIN, RATE_KBPS_MAX, 7);
+			const burst = parse_uint_bounded(softBurstInput.value, BURST_BYTES_MIN, BURST_BYTES_MAX, 7);
 
 			if (!ifname) {
 				ui.addNotification(null, E('p', {}, [ _('Target interface is required.') ]), 'error');
@@ -1122,76 +1076,15 @@ return view.extend({
 			});
 		});
 
-		floodMaskInput.addEventListener('blur', function() {
-			const parsedMask = parse_mask_input(floodMaskInput.value);
-			floodMaskInput.value = fmt_mask_hex(parsedMask == null ? FILTER_SAFE_DEFAULT : parsedMask);
-		});
-
-		floodApplyBtn.addEventListener('click', function(ev) {
-			ev.preventDefault();
-			if (!floodSupported)
-				return;
-
-			const parsedMask = parse_mask_input(floodMaskInput.value);
-			const force = floodForce.checked ? 1 : 0;
-			const target = floodTarget.value || 'both';
-
-			if (parsedMask == null) {
-				ui.addNotification(null,
-					E('p', {}, [ _('Mask must be decimal or hex in range 0..0x7ff') ]),
-					'error');
-				return;
-			}
-
-			if (parsedMask === FILTER_MASK_DANGEROUS && !force) {
-				ui.addNotification(null,
-					E('p', {}, [ _('0x7ff drops all egress flood traffic. Check force to apply.') ]),
-					'error');
-				return;
-			}
-
-			floodApplyBtn.disabled = true;
-			Promise.resolve(applyFlood(target, fmt_mask_hex(parsedMask), force)).finally(function() {
-				floodApplyBtn.disabled = false;
-			});
-		});
-
-		applyFloodState(currentFlood);
 		applyStatusState(currentStatus);
 
 		const subtitleText = persistentSupported
-			? _('Per-port hardware shaping is stored in UCI and applied at boot.')
-			: _('Per-port hardware shaping and flood-filter control. Settings are runtime-only.');
+			? _('Per-port hardware shaping and flood forwarding flags are stored in UCI and applied at boot.')
+			: _('Per-port hardware shaping and flood forwarding controls. Settings are runtime-only.');
 
 		const subtitleHint = persistentSupported
 			? _('Use this page for direct control; reboot keeps configured shaper values.')
 			: _('Use this page for quick tuning and diagnostics.');
-
-		const floodAdvanced = floodSupported ? E('details', { style: 'margin-top:8px;' }, [
-			E('summary', {
-				style: 'cursor:pointer;font-weight:600;'
-			}, [ _('Advanced flood filter') ]),
-			E('div', { class: 'crq-inline', style: 'margin-top:8px;' }, [
-				E('span', {}, [ _('MCAST:'), ' ', floodMcastNow ]),
-				E('span', {}, [ _('BCAST:'), ' ', floodBcastNow ])
-			]),
-			E('div', { class: 'crq-row' }, [
-				floodTarget,
-				floodMaskInput,
-				E('label', {
-					style: 'display:flex;align-items:center;gap:4px;'
-				}, [
-					floodForce,
-					E('span', {}, [ _('Force 0x7ff') ])
-				]),
-				floodApplyBtn
-			]),
-			E('div', { class: 'crq-help' }, [
-				_('Safe default is 0x400 (drop flood to internal MCU only).'),
-				' ',
-				_('0x7ff can blackhole ARP/ND and break LAN reachability.')
-			])
-		]) : null;
 
 		const switchExtraPanelChildren = [
 			E('h3', {}, [ _('Switch QoS Controls') ]),
@@ -1211,12 +1104,11 @@ return view.extend({
 			E('div', { class: 'crq-help' }, [
 				_('These shortcuts use the same hardware offload backend as per-port settings.'),
 				' ',
-				_('Global toggle controls boot-time apply behavior via UCI.')
+				_('Global toggle controls boot-time apply behavior via UCI.'),
+				' ',
+				portFloodSupported ? _('Per-port multicast/broadcast flood forwarding is configurable on each card.') : _('Per-port flood controls are unavailable in this backend.')
 			])
 		];
-
-		if (floodAdvanced)
-			switchExtraPanelChildren.push(floodAdvanced);
 
 		const switchExtraPanel = E('section', { class: 'crq-panel' }, switchExtraPanelChildren);
 

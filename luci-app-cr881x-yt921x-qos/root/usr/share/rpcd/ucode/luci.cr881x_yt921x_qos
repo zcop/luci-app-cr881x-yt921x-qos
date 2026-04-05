@@ -11,7 +11,8 @@ const default_soft_iface = 'br-guest';
 const default_soft_enabled = 0;
 const default_soft_rate_kbps = 50000;
 const default_soft_burst_bytes = 65536;
-const filter_mask_max = 0x7ff;
+const default_port_mcast_flood = 1;
+const default_port_bcast_flood = 1;
 const rate_kbps_min = 1;
 const rate_kbps_max = 2500000;
 const burst_bytes_min = 64;
@@ -71,6 +72,8 @@ function parse_tbf_line(line) {
 		ebs: 0,
 		rate_kbps: -1,
 		burst_bytes: -1,
+		mcast_flood: default_port_mcast_flood,
+		bcast_flood: default_port_bcast_flood,
 		raw: line
 	};
 
@@ -98,6 +101,10 @@ function parse_tbf_line(line) {
 			item.rate_kbps = +v;
 		else if (k == 'burst_bytes')
 			item.burst_bytes = +v;
+		else if (k == 'mcast_flood')
+			item.mcast_flood = int(+v) ? 1 : 0;
+		else if (k == 'bcast_flood')
+			item.bcast_flood = int(+v) ? 1 : 0;
 	}
 
 	if (!(item.rate_kbps >= 0))
@@ -255,65 +262,6 @@ function parse_ifname(v, fallback) {
 	return s;
 }
 
-function parse_flood_output(output) {
-	let mcast = null;
-	let bcast = null;
-	let lines = split(output || '', '\n');
-
-	for (let i = 0; i < length(lines); i++) {
-		let line = trim(lines[i]);
-		let eq = index(line, '=');
-		if (eq <= 0)
-			continue;
-
-		let key = trim(substr(line, 0, eq));
-		let val = trim(substr(line, eq + 1));
-		let parsed = +val;
-		if (!(parsed >= 0))
-			continue;
-
-		if (key == 'mcast')
-			mcast = int(parsed) & filter_mask_max;
-		else if (key == 'bcast')
-			bcast = int(parsed) & filter_mask_max;
-	}
-
-	return {
-		mcast,
-		bcast
-	};
-}
-
-function flood_filter_call() {
-	if (!get_info_call().features.flood_filter) {
-		return {
-			ok: false,
-			code: -95,
-			error: 'flood filter control is unsupported by current backend'
-		};
-	}
-
-	if (!access(helper, 'x')) {
-		return {
-			ok: false,
-			code: 127,
-			error: `${helper} is missing`
-		};
-	}
-
-	const res = run_helper([ 'get-flood-filter' ]);
-	const parsed = parse_flood_output(res.output);
-
-	return {
-		ok: (res.code == 0),
-		code: res.code,
-		error: (res.code == 0) ? '' : (res.output || 'get_flood_filter failed'),
-		output: res.output,
-		mcast: parsed.mcast,
-		bcast: parsed.bcast
-	};
-}
-
 function get_info_call() {
 	return {
 		helper,
@@ -323,6 +271,7 @@ function get_info_call() {
 			persistent: true,
 			port_tbf: true,
 			soft_tbf: true,
+			port_flood_flags: true,
 			flood_filter: false
 		}
 	};
@@ -341,6 +290,8 @@ function set_port_call(args) {
 	const enable = parse_bool01(args?.enable, 1);
 	const rate_kbps = parse_uint_bounded(args?.rate_kbps, 0, rate_kbps_min, rate_kbps_max, 7);
 	const burst_bytes = parse_uint_bounded(args?.burst_bytes, default_burst_bytes, burst_bytes_min, burst_bytes_max, 7);
+	const mcast_flood = parse_bool01(args?.mcast_flood, default_port_mcast_flood);
+	const bcast_flood = parse_bool01(args?.bcast_flood, default_port_bcast_flood);
 
 	if (port == null || port > port_max) {
 		return {
@@ -373,6 +324,13 @@ function set_port_call(args) {
 			error: `burst_bytes must be ${burst_bytes_min}..${burst_bytes_max} when enabled`
 		};
 	}
+	if (mcast_flood == null || bcast_flood == null) {
+		return {
+			ok: false,
+			code: -22,
+			error: 'mcast_flood and bcast_flood must be 0 or 1'
+		};
+	}
 
 	const cmd = !enable ? 'disable-port' : 'set-port';
 	const cmd_args = [ cmd, `${port}` ];
@@ -382,13 +340,21 @@ function set_port_call(args) {
 	}
 
 	const res = run_helper(cmd_args);
+	let flood_res = { code: 0, output: '' };
+	if (res.code == 0)
+		flood_res = run_helper([ 'set-port-flood', `${port}`, `${mcast_flood}`, `${bcast_flood}` ]);
+
 	const st = status_call();
+	const op_ok = (res.code == 0 && flood_res.code == 0);
+	const op_err = (res.code != 0)
+		? (res.output || 'set_port failed')
+		: ((flood_res.code != 0) ? (flood_res.output || 'set_port_flood failed') : '');
 
 	return {
-		ok: (res.code == 0),
-		code: res.code,
-		error: (res.code == 0) ? '' : (res.output || 'set_port failed'),
-		output: res.output,
+		ok: op_ok,
+		code: op_ok ? 0 : ((res.code != 0) ? res.code : flood_res.code),
+		error: op_err,
+		output: trim((res.output || '') + '\n' + (flood_res.output || '')),
 		status: st
 	};
 }
@@ -423,15 +389,7 @@ function set_global_call(args) {
 	};
 }
 
-function set_flood_filter_call(args) {
-	if (!get_info_call().features.flood_filter) {
-		return {
-			ok: false,
-			code: -95,
-			error: 'flood filter control is unsupported by current backend'
-		};
-	}
-
+function set_port_flood_call(args) {
 	if (!access(helper, 'x')) {
 		return {
 			ok: false,
@@ -440,45 +398,33 @@ function set_flood_filter_call(args) {
 		};
 	}
 
-	const target = trim(`${args?.target || ''}`);
-	const mask = trim(`${args?.mask || ''}`);
-	const force = parse_bool01(args?.force, 0);
+	const port = parse_uint_bounded(args?.port, null, 0, port_max, 1);
+	const mcast_flood = parse_bool01(args?.mcast_flood, null);
+	const bcast_flood = parse_bool01(args?.bcast_flood, null);
 
-	if (target != 'mcast' && target != 'bcast' && target != 'both') {
+	if (port == null || port > port_max) {
 		return {
 			ok: false,
 			code: -22,
-			error: 'invalid target (mcast|bcast|both)'
+			error: `invalid port (0..${port_max})`
 		};
 	}
 
-	if (!mask) {
+	if (mcast_flood == null || bcast_flood == null) {
 		return {
 			ok: false,
 			code: -22,
-			error: 'mask is required'
+			error: 'mcast_flood and bcast_flood must be 0 or 1'
 		};
 	}
 
-	if (force == null) {
-		return {
-			ok: false,
-			code: -22,
-			error: 'force must be 0 or 1'
-		};
-	}
-
-	const cmd_args = [ 'set-flood-filter', target, mask ];
-	if (force)
-		cmd_args[length(cmd_args)] = '--force';
-
-	const res = run_helper(cmd_args);
-	const st = flood_filter_call();
+	const res = run_helper([ 'set-port-flood', `${port}`, `${mcast_flood}`, `${bcast_flood}` ]);
+	const st = status_call();
 
 	return {
 		ok: (res.code == 0),
 		code: res.code,
-		error: (res.code == 0) ? '' : (res.output || 'set_flood_filter failed'),
+		error: (res.code == 0) ? '' : (res.output || 'set_port_flood failed'),
 		output: res.output,
 		status: st
 	};
@@ -555,18 +501,14 @@ const methods = {
 		}
 	},
 
-	get_flood_filter: {
-		call: function() {
-			return flood_filter_call();
-		}
-	},
-
 	set_port: {
 		args: {
 			port: 'port',
 			enable: 'enable',
 			rate_kbps: 'rate_kbps',
-			burst_bytes: 'burst_bytes'
+			burst_bytes: 'burst_bytes',
+			mcast_flood: 'mcast_flood',
+			bcast_flood: 'bcast_flood'
 		},
 		call: function(req) {
 			return set_port_call(req?.args || {});
@@ -582,14 +524,14 @@ const methods = {
 		}
 	},
 
-	set_flood_filter: {
+	set_port_flood: {
 		args: {
-			target: 'target',
-			mask: 'mask',
-			force: 'force'
+			port: 'port',
+			mcast_flood: 'mcast_flood',
+			bcast_flood: 'bcast_flood'
 		},
 		call: function(req) {
-			return set_flood_filter_call(req?.args || {});
+			return set_port_flood_call(req?.args || {});
 		}
 	},
 

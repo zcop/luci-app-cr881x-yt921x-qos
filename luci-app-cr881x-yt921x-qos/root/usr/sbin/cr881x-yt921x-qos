@@ -9,6 +9,8 @@ DEFAULT_SOFT_IFACE="br-guest"
 DEFAULT_SOFT_ENABLED=0
 DEFAULT_SOFT_RATE_KBPS=50000
 DEFAULT_SOFT_BURST_BYTES=65536
+DEFAULT_PORT_MCAST_FLOOD=1
+DEFAULT_PORT_BCAST_FLOOD=1
 
 RATE_KBPS_MIN=1
 RATE_KBPS_MAX=2500000
@@ -116,6 +118,10 @@ ensure_tools() {
 		echo "error: tc command is missing (install ip-full)" >&2
 		return 1
 	}
+	command -v bridge >/dev/null 2>&1 || {
+		echo "error: bridge command is missing (install ip-full)" >&2
+		return 1
+	}
 	command -v uci >/dev/null 2>&1 || {
 		echo "error: uci command is missing" >&2
 		return 1
@@ -137,6 +143,11 @@ ensure_port_section() {
 		uci -q set "${CFG_PKG}.${sec}.rate_kbps=${DEFAULT_RATE_KBPS}"
 		uci -q set "${CFG_PKG}.${sec}.burst_bytes=${DEFAULT_BURST_BYTES}"
 	fi
+
+	uci -q get "${CFG_PKG}.${sec}.mcast_flood" >/dev/null 2>&1 || \
+		uci -q set "${CFG_PKG}.${sec}.mcast_flood=${DEFAULT_PORT_MCAST_FLOOD}"
+	uci -q get "${CFG_PKG}.${sec}.bcast_flood" >/dev/null 2>&1 || \
+		uci -q set "${CFG_PKG}.${sec}.bcast_flood=${DEFAULT_PORT_BCAST_FLOOD}"
 }
 
 cfg_get_port_enabled() {
@@ -154,6 +165,16 @@ cfg_get_port_burst() {
 	uci -q get "${CFG_PKG}.port${port}.burst_bytes" || echo "$DEFAULT_BURST_BYTES"
 }
 
+cfg_get_port_mcast_flood() {
+	local port="$1"
+	uci -q get "${CFG_PKG}.port${port}.mcast_flood" || echo "$DEFAULT_PORT_MCAST_FLOOD"
+}
+
+cfg_get_port_bcast_flood() {
+	local port="$1"
+	uci -q get "${CFG_PKG}.port${port}.bcast_flood" || echo "$DEFAULT_PORT_BCAST_FLOOD"
+}
+
 cfg_set_port() {
 	local port="$1"
 	local enabled="$2"
@@ -164,6 +185,17 @@ cfg_set_port() {
 	uci -q set "${CFG_PKG}.port${port}.enabled=${enabled}"
 	uci -q set "${CFG_PKG}.port${port}.rate_kbps=${rate_kbps}"
 	uci -q set "${CFG_PKG}.port${port}.burst_bytes=${burst_bytes}"
+	uci -q commit "$CFG_PKG"
+}
+
+cfg_set_port_flood() {
+	local port="$1"
+	local mcast_flood="$2"
+	local bcast_flood="$3"
+
+	ensure_port_section "$port"
+	uci -q set "${CFG_PKG}.port${port}.mcast_flood=${mcast_flood}"
+	uci -q set "${CFG_PKG}.port${port}.bcast_flood=${bcast_flood}"
 	uci -q commit "$CFG_PKG"
 }
 
@@ -285,6 +317,43 @@ apply_port_runtime() {
 	fi
 }
 
+bridge_flag_state() {
+	local iface="$1"
+	local flag="$2"
+	local out
+
+	out="$(bridge -d link show dev "$iface" 2>/dev/null | tr '\n' ' ' || true)"
+	out=" ${out} "
+	case "$out" in
+	*" ${flag} off "*) echo 0 ;;
+	*" ${flag} on "*) echo 1 ;;
+	*) echo -1 ;;
+	esac
+}
+
+apply_port_flood_runtime() {
+	local port="$1"
+	local mcast_flood="$2"
+	local bcast_flood="$3"
+	local iface
+	local mcast_word
+	local bcast_word
+
+	iface="$(port_iface "$port")"
+	if [ "$mcast_flood" -eq 1 ]; then
+		mcast_word="on"
+	else
+		mcast_word="off"
+	fi
+	if [ "$bcast_flood" -eq 1 ]; then
+		bcast_word="on"
+	else
+		bcast_word="off"
+	fi
+
+	bridge link set dev "$iface" mcast_flood "$mcast_word" bcast_flood "$bcast_word" >/dev/null 2>&1
+}
+
 apply_soft_runtime() {
 	local ifname="$1"
 	local enabled="$2"
@@ -313,11 +382,18 @@ show_status_port() {
 	local burst_bytes
 	local eir
 	local ebs
+	local cfg_mcast_flood
+	local cfg_bcast_flood
+	local mcast_flood
+	local bcast_flood
+	local iface
 
 	require_port "$port" || return 1
 	enabled="$(cfg_get_port_enabled "$port")"
 	rate_kbps="$(cfg_get_port_rate "$port")"
 	burst_bytes="$(cfg_get_port_burst "$port")"
+	cfg_mcast_flood="$(cfg_get_port_mcast_flood "$port")"
+	cfg_bcast_flood="$(cfg_get_port_bcast_flood "$port")"
 
 	if ! require_uinteger enabled "$enabled"; then
 		enabled=0
@@ -327,6 +403,22 @@ show_status_port() {
 	fi
 	if ! validate_burst_bytes "$burst_bytes"; then
 		burst_bytes="$DEFAULT_BURST_BYTES"
+	fi
+	if ! is_enabled_flag "$cfg_mcast_flood"; then
+		cfg_mcast_flood="$DEFAULT_PORT_MCAST_FLOOD"
+	fi
+	if ! is_enabled_flag "$cfg_bcast_flood"; then
+		cfg_bcast_flood="$DEFAULT_PORT_BCAST_FLOOD"
+	fi
+
+	iface="$(port_iface "$port")"
+	mcast_flood="$(bridge_flag_state "$iface" mcast_flood)"
+	bcast_flood="$(bridge_flag_state "$iface" bcast_flood)"
+	if [ "$mcast_flood" -lt 0 ]; then
+		mcast_flood="$cfg_mcast_flood"
+	fi
+	if [ "$bcast_flood" -lt 0 ]; then
+		bcast_flood="$cfg_bcast_flood"
 	fi
 
 	if [ "$enabled" -eq 1 ]; then
@@ -339,7 +431,7 @@ show_status_port() {
 		burst_bytes=0
 	fi
 
-	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} ebs=${ebs} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes}"
+	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} ebs=${ebs} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes} mcast_flood=${mcast_flood} bcast_flood=${bcast_flood}"
 }
 
 show_status_soft() {
@@ -445,6 +537,28 @@ disable_port() {
 	show_status_port "$port"
 }
 
+set_port_flood() {
+	local port="$1"
+	local mcast_flood="$2"
+	local bcast_flood="$3"
+
+	ensure_tools || return 1
+	ensure_config
+	require_port "$port" || return 1
+	if ! is_enabled_flag "$mcast_flood"; then
+		echo "error: mcast_flood must be 0 or 1" >&2
+		return 1
+	fi
+	if ! is_enabled_flag "$bcast_flood"; then
+		echo "error: bcast_flood must be 0 or 1" >&2
+		return 1
+	fi
+
+	cfg_set_port_flood "$port" "$mcast_flood" "$bcast_flood"
+	apply_port_flood_runtime "$port" "$mcast_flood" "$bcast_flood"
+	show_status_port "$port"
+}
+
 set_soft() {
 	local ifname="$1"
 	local enabled="$2"
@@ -473,24 +587,28 @@ set_soft() {
 
 apply_saved() {
 	local port
+	local global_enabled
 	local enabled
 	local rate_kbps
 	local burst_bytes
+	local mcast_flood
+	local bcast_flood
 
 	ensure_tools || return 1
 	ensure_config
 
-	if [ "$(cfg_get_global_enabled)" = "0" ]; then
-		for port in 0 1 2 3; do
-			apply_port_runtime "$port" 0 0 0
-		done
-		return 0
+	global_enabled="$(cfg_get_global_enabled)"
+	if ! is_enabled_flag "$global_enabled"; then
+		global_enabled=1
 	fi
 
 	for port in 0 1 2 3; do
+		ensure_port_section "$port"
 		enabled="$(cfg_get_port_enabled "$port")"
 		rate_kbps="$(cfg_get_port_rate "$port")"
 		burst_bytes="$(cfg_get_port_burst "$port")"
+		mcast_flood="$(cfg_get_port_mcast_flood "$port")"
+		bcast_flood="$(cfg_get_port_bcast_flood "$port")"
 
 		if ! is_enabled_flag "$enabled"; then
 			enabled=0
@@ -501,8 +619,16 @@ apply_saved() {
 		if ! validate_burst_bytes "$burst_bytes"; then
 			burst_bytes="$DEFAULT_BURST_BYTES"
 		fi
+		if ! is_enabled_flag "$mcast_flood"; then
+			mcast_flood="$DEFAULT_PORT_MCAST_FLOOD"
+		fi
+		if ! is_enabled_flag "$bcast_flood"; then
+			bcast_flood="$DEFAULT_PORT_BCAST_FLOOD"
+		fi
 
-		if [ "$enabled" -eq 1 ]; then
+		apply_port_flood_runtime "$port" "$mcast_flood" "$bcast_flood" || true
+
+		if [ "$global_enabled" -eq 1 ] && [ "$enabled" -eq 1 ]; then
 			apply_port_runtime "$port" 1 "$rate_kbps" "$burst_bytes" || true
 		else
 			apply_port_runtime "$port" 0 0 0 || true
@@ -532,7 +658,7 @@ apply_saved() {
 		soft_burst_bytes="$DEFAULT_SOFT_BURST_BYTES"
 	fi
 
-	if [ "$soft_enabled" -eq 1 ]; then
+	if [ "$global_enabled" -eq 1 ] && [ "$soft_enabled" -eq 1 ]; then
 		apply_soft_runtime "$soft_ifname" 1 "$soft_rate_kbps" "$soft_burst_bytes" || true
 	else
 		apply_soft_runtime "$soft_ifname" 0 0 0 || true
@@ -558,6 +684,8 @@ Commands:
   status-port <port>             Dump QoS status for one port
   set-port <port> <kbps> [burst] Set persistent per-port TBF
   disable-port <port>            Disable persistent per-port TBF
+  set-port-flood <port> <mcast 0|1> <bcast 0|1>
+                                Set persistent per-port flood flags
   set-global <0|1>               Set persistent global QoS master state
   set-soft <if> <0|1> <kbps> [burst]
                                 Set persistent software TBF on interface
@@ -585,6 +713,10 @@ set-port)
 disable-port)
 	shift || true
 	disable_port "${1:-}"
+	;;
+set-port-flood)
+	shift || true
+	set_port_flood "${1:-}" "${2:-}" "${3:-}"
 	;;
 set-global)
 	shift || true
