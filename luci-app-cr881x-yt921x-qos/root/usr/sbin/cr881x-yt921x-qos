@@ -21,6 +21,17 @@ RATE_OFFSET=130
 EIR_MIN_SAFE=300
 EIR_MAX=262143
 
+# Empirical shaping calibration model (CR881x current path)
+# Below 120 mbit setpoint:
+#   measured_mbit ~= 0.145 * set_mbit + 0.55
+# Above 120 mbit:
+#   measured_mbit ~= 17.75 (plateau)
+CAL_SET_MBIT_LIN_MAX=120
+CAL_LIN_A_NUM=145
+CAL_LIN_A_DEN=1000
+CAL_LIN_B_X1000=550
+CAL_MEAS_MBIT_SAT_X1000=17750
+
 EBS_UNIT=64
 EBS_MAX=16383
 BURST_BYTES_MIN=64
@@ -296,6 +307,72 @@ burst_bytes_to_ebs() {
 	fi
 
 	echo "$ebs"
+}
+
+estimate_measured_kbps_from_set_kbps() {
+	local set_kbps="$1"
+	local set_mbit
+	local measured_x1000
+
+	require_uinteger set_kbps "$set_kbps" || return 1
+	set_mbit=$(( set_kbps / 1000 ))
+	if [ "$set_mbit" -ge "$CAL_SET_MBIT_LIN_MAX" ]; then
+		measured_x1000="$CAL_MEAS_MBIT_SAT_X1000"
+	else
+		measured_x1000=$(( (CAL_LIN_A_NUM * set_kbps + (CAL_LIN_A_DEN / 2)) / CAL_LIN_A_DEN + CAL_LIN_B_X1000 ))
+	fi
+	echo "$measured_x1000"
+}
+
+estimate_measured_rate() {
+	local set_kbps="$1"
+	local measured_x1000
+	local measured_mbit_int
+	local measured_mbit_frac
+
+	validate_rate_kbps "$set_kbps" || return 1
+	measured_x1000="$(estimate_measured_kbps_from_set_kbps "$set_kbps")"
+	measured_mbit_int=$(( measured_x1000 / 1000 ))
+	measured_mbit_frac=$(( measured_x1000 % 1000 ))
+
+	printf "set_kbps=%s estimated_measured_kbps=%s estimated_measured_mbit=%d.%03d\n" \
+		"$set_kbps" "$measured_x1000" "$measured_mbit_int" "$measured_mbit_frac"
+}
+
+suggest_set_rate() {
+	local target_mbit="$1"
+	local target_x1000
+	local set_kbps
+	local measured_x1000
+	local measured_mbit_int
+	local measured_mbit_frac
+
+	require_uinteger_range target_mbit "$target_mbit" 1 10000 || return 1
+	target_x1000=$(( target_mbit * 1000 ))
+
+	if [ "$target_x1000" -ge "$CAL_MEAS_MBIT_SAT_X1000" ]; then
+		set_kbps=$(( CAL_SET_MBIT_LIN_MAX * 1000 ))
+	else
+		if [ "$target_x1000" -le "$CAL_LIN_B_X1000" ]; then
+			set_kbps="$RATE_KBPS_MIN"
+		else
+			set_kbps=$(( ((target_x1000 - CAL_LIN_B_X1000) * CAL_LIN_A_DEN + (CAL_LIN_A_NUM / 2)) / CAL_LIN_A_NUM ))
+			if [ "$set_kbps" -lt "$RATE_KBPS_MIN" ]; then
+				set_kbps="$RATE_KBPS_MIN"
+			fi
+		fi
+	fi
+
+	if [ "$set_kbps" -gt "$RATE_KBPS_MAX" ]; then
+		set_kbps="$RATE_KBPS_MAX"
+	fi
+
+	measured_x1000="$(estimate_measured_kbps_from_set_kbps "$set_kbps")"
+	measured_mbit_int=$(( measured_x1000 / 1000 ))
+	measured_mbit_frac=$(( measured_x1000 % 1000 ))
+
+	printf "target_mbit=%s recommended_set_kbps=%s estimated_measured_kbps=%s estimated_measured_mbit=%d.%03d\n" \
+		"$target_mbit" "$set_kbps" "$measured_x1000" "$measured_mbit_int" "$measured_mbit_frac"
 }
 
 apply_port_runtime() {
@@ -682,6 +759,8 @@ Usage: cr881x-yt921x-qos <command>
 Commands:
   status                         Dump QoS status for all ports
   status-port <port>             Dump QoS status for one port
+  estimate-rate <set_kbps>       Estimate real throughput from configured setpoint
+  suggest-rate <target_mbit>     Recommend set_kbps for desired real Mbps
   set-port <port> <kbps> [burst] Set persistent per-port TBF
   disable-port <port>            Disable persistent per-port TBF
   set-port-flood <port> <mcast 0|1> <bcast 0|1>
@@ -705,6 +784,14 @@ status)
 status-port)
 	shift || true
 	show_status_port "${1:-}"
+	;;
+estimate-rate)
+	shift || true
+	estimate_measured_rate "${1:-}"
+	;;
+suggest-rate)
+	shift || true
+	suggest_set_rate "${1:-}"
 	;;
 set-port)
 	shift || true

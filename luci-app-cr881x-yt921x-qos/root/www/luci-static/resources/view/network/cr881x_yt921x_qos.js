@@ -11,6 +11,15 @@ const BURST_BYTES_MIN = 64;
 const BURST_BYTES_MAX = 1048512;
 const STYLE_ID = 'cr881x-yt921x-qos-style';
 
+/* Empirical calibration for current CR881x datapath.
+ * set_mbit < 120: measured_mbit ~= 0.145 * set_mbit + 0.55
+ * set_mbit >= 120: measured_mbit ~= 17.75 (plateau)
+ */
+const CAL_SET_KBPS_LIN_MAX = 120000;
+const CAL_MEASURED_KBPS_SAT = 17750;
+const CAL_A = 0.145;
+const CAL_B_KBPS = 550;
+
 function port_label(port) {
 	switch (port) {
 	case 0:
@@ -472,6 +481,34 @@ function status_map_by_port(ports, max_ports) {
 	return map;
 }
 
+function estimate_measured_kbps_from_set_kbps(set_kbps) {
+	const set = Math.max(RATE_KBPS_MIN, Math.round(+set_kbps || 0));
+
+	if (set >= CAL_SET_KBPS_LIN_MAX)
+		return CAL_MEASURED_KBPS_SAT;
+
+	return Math.max(1, Math.round((CAL_A * set) + CAL_B_KBPS));
+}
+
+function suggest_set_kbps_from_target_mbit(target_mbit) {
+	const target = Math.max(1, Math.round(+target_mbit || 0));
+	const target_kbps = target * 1000;
+
+	if (target_kbps >= CAL_MEASURED_KBPS_SAT)
+		return CAL_SET_KBPS_LIN_MAX;
+
+	let set = Math.round((target_kbps - CAL_B_KBPS) / CAL_A);
+	if (!Number.isFinite(set))
+		set = RATE_KBPS_MIN;
+
+	if (set < RATE_KBPS_MIN)
+		set = RATE_KBPS_MIN;
+	if (set > RATE_KBPS_MAX)
+		set = RATE_KBPS_MAX;
+
+	return set;
+}
+
 function helper_path_node(path) {
 	return E('code', {
 		style: 'font-size:12px;display:block;overflow-wrap:anywhere;'
@@ -523,6 +560,20 @@ function port_card(port, st, apply_cb, opts) {
 		class: 'cbi-input-text crq-num-input',
 		title: _('Burst size in bytes') + ' (' + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ')'
 	});
+	const targetMbitInput = E('input', {
+		type: 'text',
+		inputmode: 'numeric',
+		pattern: '[0-9]*',
+		maxlength: '5',
+		class: 'cbi-input-text crq-num-input',
+		title: _('Target measured speed in Mbps') + ' (1..10000)'
+	});
+	const autoSetBtn = E('button', {
+		type: 'button',
+		class: 'cbi-button cbi-button-neutral',
+		title: _('Convert target measured Mbps to calibrated setpoint')
+	}, [ _('Auto set') ]);
+	const calibratedHint = E('div', { class: 'crq-help', style: 'margin-top:6px;' });
 	const enBox = E('input', { type: 'checkbox' });
 	const mcastFloodBox = E('input', { type: 'checkbox' });
 	const bcastFloodBox = E('input', { type: 'checkbox' });
@@ -534,6 +585,7 @@ function port_card(port, st, apply_cb, opts) {
 
 	rateInput.value = String(Math.max(1, liveRate || 100000));
 	burstInput.value = String(Math.max(64, liveBurst || DEFAULT_BURST_BYTES));
+	targetMbitInput.value = '';
 	enBox.checked = enabled;
 	mcastFloodBox.checked = !!mcastFlood;
 	bcastFloodBox.checked = !!bcastFlood;
@@ -565,11 +617,25 @@ function port_card(port, st, apply_cb, opts) {
 		input.value = String(n);
 	}
 
+	function refresh_calibrated_hint() {
+		const rate = parse_uint_bounded(rateInput.value, RATE_KBPS_MIN, RATE_KBPS_MAX, 7);
+
+		if (rate == null) {
+			calibratedHint.textContent = '';
+			return;
+		}
+
+		const measured = estimate_measured_kbps_from_set_kbps(rate);
+		calibratedHint.textContent = _('Estimated measured rate: ') + fmt_rate_short(measured);
+	}
+
 	rateInput.addEventListener('input', function() {
 		sanitize_digits_input(rateInput, 7);
+		refresh_calibrated_hint();
 	});
 	rateInput.addEventListener('blur', function() {
 		clamp_digits_input(rateInput, RATE_KBPS_MIN, RATE_KBPS_MAX, Math.max(1, liveRate || 100000), 7);
+		refresh_calibrated_hint();
 	});
 
 	burstInput.addEventListener('input', function() {
@@ -579,8 +645,33 @@ function port_card(port, st, apply_cb, opts) {
 		clamp_digits_input(burstInput, BURST_BYTES_MIN, BURST_BYTES_MAX, Math.max(64, liveBurst || DEFAULT_BURST_BYTES), 7);
 	});
 
+	targetMbitInput.addEventListener('input', function() {
+		sanitize_digits_input(targetMbitInput, 5);
+	});
+	targetMbitInput.addEventListener('blur', function() {
+		if (!targetMbitInput.value)
+			return;
+		clamp_digits_input(targetMbitInput, 1, 10000, 10, 5);
+	});
+
+	autoSetBtn.addEventListener('click', function(ev) {
+		ev.preventDefault();
+		const target = parse_uint_bounded(targetMbitInput.value, 1, 10000, 5);
+
+		if (target == null) {
+			ui.addNotification(null, E('p', {}, [
+				_('Target Mbps must be numeric and in range 1..10000')
+			]), 'error');
+			return;
+		}
+
+		rateInput.value = String(suggest_set_kbps_from_target_mbit(target));
+		refresh_calibrated_hint();
+	});
+
 	const chip = E('span', { class: 'crq-chip' + (enabled ? '' : ' off') }, [ enabled ? _('Enabled') : _('Disabled') ]);
 	const meterFill = E('span', { style: 'width:' + Math.max(1, Math.min(100, Math.round((liveRate / 1000000) * 100))) + '%;' });
+	refresh_calibrated_hint();
 
 	function run_apply(ev) {
 		ev.preventDefault();
@@ -670,6 +761,13 @@ function port_card(port, st, apply_cb, opts) {
 							burstInput
 						]),
 						E('div', { class: 'crq-field-row' }, [
+							E('label', {}, [ _('Target (Mbps)') ]),
+							E('div', { style: 'display:flex;gap:6px;align-items:center;' }, [
+								targetMbitInput,
+								autoSetBtn
+							])
+						]),
+						E('div', { class: 'crq-field-row' }, [
 							E('label', {}, [ _('Allow multicast flood') ]),
 							mcastFloodBox
 						]),
@@ -683,7 +781,8 @@ function port_card(port, st, apply_cb, opts) {
 						' | ',
 						_('Burst: ') + BURST_BYTES_MIN + '..' + BURST_BYTES_MAX + ' bytes',
 						floodSupported ? '' : (' | ' + _('Flood controls unavailable in backend'))
-					])
+					]),
+					calibratedHint
 				]),
 				E('div', {}, [
 				E('div', { class: 'crq-k' }, [ _('Presets') ]),
