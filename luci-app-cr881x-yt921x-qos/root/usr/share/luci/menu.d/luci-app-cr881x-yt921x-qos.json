@@ -1,6 +1,6 @@
 {
 	"admin/network/cr881x-yt921x-qos": {
-		"title": "CR881x QoS Offload",
+		"title": "QoS",
 		"order": 96,
 		"action": {
 			"type": "view",
