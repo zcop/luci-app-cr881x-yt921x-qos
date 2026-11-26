@@ -15,7 +15,8 @@ while retaining each socket's multicast and broadcast forwarding flags.
 Operations run in sequence. If one fails, the UI stops, reports partial
 completion and requires a refresh before another attempt.
 
-**Advanced** in each editor contains burst size and forwarding controls.
+**Advanced** in each editor contains burst size and, for bridge ports,
+forwarding controls.
 Broadcast restrictions can disrupt ARP and discovery; keep their defaults unless
 you specifically need to restrict them. A forwarding-only edit uses the separate
 backend method, preserving the existing limiter.
@@ -24,7 +25,7 @@ backend method, preserving the existing limiter.
 
 - **Profile & startup** controls the saved profile. Applying it immediately
   restores all saved port/software limits and forwarding settings, and enables
-  startup restore. Stopping it removes current limiters and disables startup
+  startup restore. Stopping it removes the app's limiters and disables startup
   restore, keeping saved values. Saved forwarding settings are reapplied in
   either case. Direct port edits still apply immediately when startup restore
   is off.
@@ -33,17 +34,22 @@ backend method, preserving the existing limiter.
   software limiter before choosing another interface.
 - **Diagnostics** exposes helper output on request.
 
-Settings persist in `/etc/config/cr881x_yt921x_qos`. The existing init script
-restores them at boot. The app uses `tc`, `bridge` and UCI via rpcd; it does not
-require debugfs or patch LuCI core. Driver support determines hardware offload.
-The UI makes no claim that a configured rate is the achieved throughput or that
-a saved setting proves the running qdisc state.
+Settings persist in `/etc/config/cr881x_yt921x_qos`. The init script restores
+them at boot. The package depends on a `tc` provider and `ip-bridge`. Driver
+support determines hardware offload. Saved limits with no running app queue
+are marked inactive.
+
+The app owns TBF qdiscs at root handles `8810:` (port) and `8811:` (software).
+The helper reports a conflict when another root qdisc occupies an interface.
+This includes a TBF installed by an older app version with an automatic
+handle. Reboot to clear an old runtime limiter before restoring its saved
+settings with the new helper.
 
 ## UI behavior and validation
 
 Version 1.1 replaces the old card layout and removes the empirical throughput
 formula, duplicate meters, and per-port calibration controls from the UI.
-The command-line backend and its legacy calibration commands are unchanged.
+The command-line backend retains the legacy calibration commands.
 
 There is no background polling, daemon, traffic probe or persistent history.
 Refresh is manual. Failed reads retain the last snapshot with a stale warning;

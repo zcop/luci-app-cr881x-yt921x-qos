@@ -5,11 +5,16 @@ START=95
 SERVICE_NAME="cr881x-yt921x-qos"
 HELPER="/usr/sbin/cr881x-yt921x-qos"
 
-start_service() {
+start() {
 	[ -x "$HELPER" ] || return 0
-	"$HELPER" apply >/dev/null 2>&1 || logger -t "$SERVICE_NAME" "failed to apply saved QoS settings"
+	local output
+	if ! output="$("$HELPER" apply 2>&1)"; then
+		logger -t "$SERVICE_NAME" "$output"
+		printf '%s\n' "$output" >&2
+		return 1
+	fi
 }
 
-reload_service() {
-	start_service
+reload() {
+	start
 }

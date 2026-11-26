@@ -74,6 +74,7 @@ function parse_tbf_line(line) {
 		burst_bytes: -1,
 		mcast_flood: default_port_mcast_flood,
 		bcast_flood: default_port_bcast_flood,
+		bridge_port: 0,
 		raw: line
 	};
 
@@ -105,6 +106,10 @@ function parse_tbf_line(line) {
 			item.mcast_flood = int(+v) ? 1 : 0;
 		else if (k == 'bcast_flood')
 			item.bcast_flood = int(+v) ? 1 : 0;
+		else if (k == 'bridge_port')
+			item.bridge_port = int(+v) ? 1 : 0;
+		else if (k == 'active')
+			item.active = int(+v);
 	}
 
 	if (!(item.rate_kbps >= 0))
@@ -148,6 +153,8 @@ function parse_soft_line(line) {
 			item.rate_kbps = int(+v);
 		else if (k == 'burst_bytes')
 			item.burst_bytes = int(+v);
+		else if (k == 'active')
+			item.active = int(+v);
 	}
 
 	return item;
@@ -290,8 +297,9 @@ function set_port_call(args) {
 	const enable = parse_bool01(args?.enable, 1);
 	const rate_kbps = parse_uint_bounded(args?.rate_kbps, 0, rate_kbps_min, rate_kbps_max, 7);
 	const burst_bytes = parse_uint_bounded(args?.burst_bytes, default_burst_bytes, burst_bytes_min, burst_bytes_max, 7);
-	const mcast_flood = parse_bool01(args?.mcast_flood, default_port_mcast_flood);
-	const bcast_flood = parse_bool01(args?.bcast_flood, default_port_bcast_flood);
+	const has_flags = args?.mcast_flood != null || args?.bcast_flood != null;
+	const mcast_flood = parse_bool01(args?.mcast_flood, null);
+	const bcast_flood = parse_bool01(args?.bcast_flood, null);
 
 	if (port == null || port > port_max) {
 		return {
@@ -324,12 +332,29 @@ function set_port_call(args) {
 			error: `burst_bytes must be ${burst_bytes_min}..${burst_bytes_max} when enabled`
 		};
 	}
-	if (mcast_flood == null || bcast_flood == null) {
+	if (has_flags && (mcast_flood == null || bcast_flood == null)) {
 		return {
 			ok: false,
 			code: -22,
 			error: 'mcast_flood and bcast_flood must be 0 or 1'
 		};
+	}
+
+	/* Older clients send flags even for a rate-only change. */
+	let change_flags = false;
+	if (has_flags) {
+		const st = status_call();
+		if (!st.ok)
+			return st;
+		for (let i = 0; i < length(st.ports); i++) {
+			const row = st.ports[i];
+			if (row.port != port)
+				continue;
+			change_flags = row.mcast_flood != mcast_flood || row.bcast_flood != bcast_flood;
+			if (change_flags && !row.bridge_port)
+				return { ok: false, code: -22, error: 'Forwarding flags require a bridge port', status: st };
+			break;
+		}
 	}
 
 	const cmd = !enable ? 'disable-port' : 'set-port';
@@ -341,7 +366,7 @@ function set_port_call(args) {
 
 	const res = run_helper(cmd_args);
 	let flood_res = { code: 0, output: '' };
-	if (res.code == 0)
+	if (res.code == 0 && change_flags)
 		flood_res = run_helper([ 'set-port-flood', `${port}`, `${mcast_flood}`, `${bcast_flood}` ]);
 
 	const st = status_call();

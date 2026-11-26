@@ -39,6 +39,9 @@ BURST_BYTES_MAX=$((EBS_MAX * EBS_UNIT))
 
 CFG_PKG="cr881x_yt921x_qos"
 CFG_FILE="/etc/config/${CFG_PKG}"
+PORT_HANDLE=8810:
+SOFT_HANDLE=8811:
+LOCK_FILE=/var/lock/cr881x-yt921x-qos.lock
 
 require_uinteger() {
 	local name="$1"
@@ -126,15 +129,24 @@ port_iface() {
 
 ensure_tools() {
 	command -v tc >/dev/null 2>&1 || {
-		echo "error: tc command is missing (install ip-full)" >&2
+		echo "error: tc command is missing (install tc-tiny or tc-full)" >&2
 		return 1
 	}
 	command -v bridge >/dev/null 2>&1 || {
-		echo "error: bridge command is missing (install ip-full)" >&2
+		echo "error: bridge command is missing (install ip-bridge)" >&2
 		return 1
 	}
 	command -v uci >/dev/null 2>&1 || {
 		echo "error: uci command is missing" >&2
+		return 1
+	}
+}
+
+lock_settings() {
+	mkdir -p "${LOCK_FILE%/*}" || return 1
+	exec 9>"$LOCK_FILE"
+	flock -x -w 10 9 || {
+		echo "error: another QoS change is in progress" >&2
 		return 1
 	}
 }
@@ -207,6 +219,7 @@ cfg_set_port_flood() {
 	ensure_port_section "$port"
 	uci -q set "${CFG_PKG}.port${port}.mcast_flood=${mcast_flood}"
 	uci -q set "${CFG_PKG}.port${port}.bcast_flood=${bcast_flood}"
+	uci -q set "${CFG_PKG}.port${port}.flood_managed=1"
 	uci -q commit "$CFG_PKG"
 }
 
@@ -375,23 +388,61 @@ suggest_set_rate() {
 		"$target_mbit" "$set_kbps" "$measured_x1000" "$measured_mbit_int" "$measured_mbit_frac"
 }
 
+root_qdisc() {
+	local output
+
+	output="$(tc qdisc show dev "$1")" || return 1
+	printf '%s\n' "$output" | awk '$1 == "qdisc" && $4 == "root" { print $2, $3; exit }'
+}
+
+apply_limit() {
+	local iface="$1" handle="$2" enabled="$3" rate="$4" burst="$5"
+	local current action
+
+	if ! iface_exists "$iface"; then
+		[ "$enabled" -eq 0 ] && return 0
+		echo "error: interface '$iface' not found" >&2
+		return 1
+	fi
+	current="$(root_qdisc "$iface")" || return 1
+	if [ "$enabled" -eq 0 ]; then
+		[ "$current" = "tbf $handle" ] || return 0
+		tc qdisc del dev "$iface" root handle "$handle"
+		return $?
+	fi
+
+	case "$current" in
+	"tbf $handle") action=change ;;
+	""|*" 0:") action=add ;;
+	*)
+		echo "error: '$iface' already has a root queue ($current). Remove it with its owner before applying this limit." >&2
+		return 1
+		;;
+	esac
+	tc qdisc "$action" dev "$iface" root handle "$handle" tbf \
+		rate "${rate}kbit" burst "$burst" latency 100ms
+}
+
+limit_state() {
+	local current
+
+	if ! iface_exists "$1"; then
+		echo 0
+		return
+	fi
+	current="$(root_qdisc "$1")" || { echo -1; return; }
+	if [ "$current" = "tbf $2" ]; then echo 1; else echo 0; fi
+}
+
 apply_port_runtime() {
-	local port="$1"
-	local enabled="$2"
-	local rate_kbps="$3"
-	local burst_bytes="$4"
 	local iface
 
-	iface="$(port_iface "$port")"
+	iface="$(port_iface "$1")" || return 1
+	apply_limit "$iface" "$PORT_HANDLE" "$2" "$3" "$4"
+}
 
-	if [ "$enabled" -eq 1 ]; then
-		tc qdisc replace dev "$iface" root tbf \
-			rate "${rate_kbps}kbit" \
-			burst "${burst_bytes}" \
-			latency 100ms >/dev/null
-	else
-		tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
-	fi
+is_bridge_port() {
+	[ -d "/sys/class/net/$1/brport" ]
 }
 
 bridge_flag_state() {
@@ -417,6 +468,10 @@ apply_port_flood_runtime() {
 	local bcast_word
 
 	iface="$(port_iface "$port")"
+	if ! is_bridge_port "$iface"; then
+		echo "error: '$iface' is not a bridge port. Forwarding flags are unavailable." >&2
+		return 1
+	fi
 	if [ "$mcast_flood" -eq 1 ]; then
 		mcast_word="on"
 	else
@@ -428,28 +483,11 @@ apply_port_flood_runtime() {
 		bcast_word="off"
 	fi
 
-	bridge link set dev "$iface" mcast_flood "$mcast_word" bcast_flood "$bcast_word" >/dev/null 2>&1
+	bridge link set dev "$iface" mcast_flood "$mcast_word" bcast_flood "$bcast_word"
 }
 
 apply_soft_runtime() {
-	local ifname="$1"
-	local enabled="$2"
-	local rate_kbps="$3"
-	local burst_bytes="$4"
-
-	if [ "$enabled" -eq 1 ]; then
-		if ! iface_exists "$ifname"; then
-			echo "error: interface '$ifname' not found" >&2
-			return 1
-		fi
-
-		tc qdisc replace dev "$ifname" root tbf \
-			rate "${rate_kbps}kbit" \
-			burst "${burst_bytes}" \
-			latency 100ms >/dev/null
-	else
-		tc qdisc del dev "$ifname" root >/dev/null 2>&1 || true
-	fi
+	apply_limit "$1" "$SOFT_HANDLE" "$2" "$3" "$4"
 }
 
 show_status_port() {
@@ -464,6 +502,7 @@ show_status_port() {
 	local mcast_flood
 	local bcast_flood
 	local iface
+	local bridge_port=0
 
 	require_port "$port" || return 1
 	enabled="$(cfg_get_port_enabled "$port")"
@@ -489,6 +528,7 @@ show_status_port() {
 	fi
 
 	iface="$(port_iface "$port")"
+	is_bridge_port "$iface" && bridge_port=1
 	mcast_flood="$(bridge_flag_state "$iface" mcast_flood)"
 	bcast_flood="$(bridge_flag_state "$iface" bcast_flood)"
 	if [ "$mcast_flood" -lt 0 ]; then
@@ -508,7 +548,7 @@ show_status_port() {
 		burst_bytes=0
 	fi
 
-	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} ebs=${ebs} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes} mcast_flood=${mcast_flood} bcast_flood=${bcast_flood}"
+	echo "tbf p${port}: en=${enabled} dual_rate=0 meter=0 eir=${eir} ebs=${ebs} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes} mcast_flood=${mcast_flood} bcast_flood=${bcast_flood} bridge_port=${bridge_port} active=$(limit_state "$iface" "$PORT_HANDLE")"
 }
 
 show_status_soft() {
@@ -539,7 +579,7 @@ show_status_soft() {
 		burst_bytes=0
 	fi
 
-	echo "soft if=${ifname} en=${enabled} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes}"
+	echo "soft if=${ifname} en=${enabled} rate_kbps=${rate_kbps} burst_bytes=${burst_bytes} active=$(limit_state "$ifname" "$SOFT_HANDLE")"
 }
 
 show_status() {
@@ -570,8 +610,8 @@ set_global() {
 		return 1
 	fi
 
+	apply_saved "$enabled" || return 1
 	cfg_set_global_enabled "$enabled"
-	apply_saved
 	echo "global enabled=${enabled}"
 }
 
@@ -631,8 +671,8 @@ set_port_flood() {
 		return 1
 	fi
 
-	cfg_set_port_flood "$port" "$mcast_flood" "$bcast_flood"
 	apply_port_flood_runtime "$port" "$mcast_flood" "$bcast_flood"
+	cfg_set_port_flood "$port" "$mcast_flood" "$bcast_flood"
 	show_status_port "$port"
 }
 
@@ -652,6 +692,11 @@ set_soft() {
 	validate_rate_kbps "$rate_kbps" || return 1
 	validate_burst_bytes "$burst_bytes" || return 1
 
+	if [ "$(cfg_get_soft_enabled)" = 1 ] && [ "$(cfg_get_soft_ifname)" != "$ifname" ]; then
+		echo "error: disable the current software limit before choosing a different interface" >&2
+		return 1
+	fi
+
 	if [ "$enabled" -eq 1 ] && ! iface_exists "$ifname"; then
 		echo "error: interface '$ifname' not found" >&2
 		return 1
@@ -670,17 +715,17 @@ apply_saved() {
 	local burst_bytes
 	local mcast_flood
 	local bcast_flood
+	local iface failed=0
 
 	ensure_tools || return 1
 	ensure_config
 
-	global_enabled="$(cfg_get_global_enabled)"
+	global_enabled="${1:-$(cfg_get_global_enabled)}"
 	if ! is_enabled_flag "$global_enabled"; then
 		global_enabled=1
 	fi
 
 	for port in 0 1 2 3; do
-		ensure_port_section "$port"
 		enabled="$(cfg_get_port_enabled "$port")"
 		rate_kbps="$(cfg_get_port_rate "$port")"
 		burst_bytes="$(cfg_get_port_burst "$port")"
@@ -703,12 +748,19 @@ apply_saved() {
 			bcast_flood="$DEFAULT_PORT_BCAST_FLOOD"
 		fi
 
-		apply_port_flood_runtime "$port" "$mcast_flood" "$bcast_flood" || true
+		iface="$(port_iface "$port")"
+		if is_bridge_port "$iface" && {
+			[ "$(uci -q get "${CFG_PKG}.port${port}.flood_managed" || true)" = 1 ] ||
+			[ "$mcast_flood" -ne "$DEFAULT_PORT_MCAST_FLOOD" ] ||
+			[ "$bcast_flood" -ne "$DEFAULT_PORT_BCAST_FLOOD" ]
+		}; then
+			apply_port_flood_runtime "$port" "$mcast_flood" "$bcast_flood" || failed=1
+		fi
 
 		if [ "$global_enabled" -eq 1 ] && [ "$enabled" -eq 1 ]; then
-			apply_port_runtime "$port" 1 "$rate_kbps" "$burst_bytes" || true
+			apply_port_runtime "$port" 1 "$rate_kbps" "$burst_bytes" || failed=1
 		else
-			apply_port_runtime "$port" 0 0 0 || true
+			apply_port_runtime "$port" 0 0 0 || failed=1
 		fi
 	done
 
@@ -736,10 +788,11 @@ apply_saved() {
 	fi
 
 	if [ "$global_enabled" -eq 1 ] && [ "$soft_enabled" -eq 1 ]; then
-		apply_soft_runtime "$soft_ifname" 1 "$soft_rate_kbps" "$soft_burst_bytes" || true
+		apply_soft_runtime "$soft_ifname" 1 "$soft_rate_kbps" "$soft_burst_bytes" || failed=1
 	else
-		apply_soft_runtime "$soft_ifname" 0 0 0 || true
+		apply_soft_runtime "$soft_ifname" 0 0 0 || failed=1
 	fi
+	return "$failed"
 }
 
 get_flood_filter() {
@@ -776,6 +829,10 @@ EOF
 }
 
 cmd="${1:-status}"
+case "$cmd" in
+	set-port|disable-port|set-port-flood|set-global|set-soft|apply)
+		lock_settings || exit 1 ;;
+esac
 case "$cmd" in
 status)
 	shift || true

@@ -62,6 +62,6 @@ return baseclass.extend({
 	},
 	key: function(row) {
 		if (!row) return 'unknown';
-		return JSON.stringify([row.port, row.ifname, row.en, row.rate_kbps, row.burst_bytes, row.mcast_flood, row.bcast_flood]);
+		return JSON.stringify([row.port, row.ifname, row.en, row.rate_kbps, row.burst_bytes, row.mcast_flood, row.bcast_flood, row.bridge_port]);
 	}
 });

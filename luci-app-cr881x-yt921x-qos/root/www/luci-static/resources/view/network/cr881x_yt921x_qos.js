@@ -8,7 +8,7 @@
 const callInfo = rpc.declare({ object: 'luci.cr881x_yt921x_qos', method: 'get_info', expect: {}, reject: true });
 const callStatus = rpc.declare({ object: 'luci.cr881x_yt921x_qos', method: 'status', expect: {}, reject: true });
 const callPort = rpc.declare({ object: 'luci.cr881x_yt921x_qos', method: 'set_port',
-	params: ['port', 'enable', 'rate_kbps', 'burst_bytes', 'mcast_flood', 'bcast_flood'], expect: {}, reject: true });
+	params: ['port', 'enable', 'rate_kbps', 'burst_bytes'], expect: {}, reject: true });
 const callFlood = rpc.declare({ object: 'luci.cr881x_yt921x_qos', method: 'set_port_flood',
 	params: ['port', 'mcast_flood', 'bcast_flood'], expect: {}, reject: true });
 const callGlobal = rpc.declare({ object: 'luci.cr881x_yt921x_qos', method: 'set_global', params: ['enable'], expect: {}, reject: true });
@@ -67,8 +67,10 @@ return view.extend({
 			edit.disabled = !available || !row || !model.flags(row) || !!this.busy || !this.features.port_tbf;
 			return E('tr', {}, [E('th', { scope: 'row' }, [E('span', { 'class': 'crq-socket', 'aria-hidden': 'true' }),
 				E('span', {}, [model.label(port), E('small', {}, ['lan1', 'lan2', 'lan3', 'wan'][port])])]),
-				E('td', { 'class': row && row.en ? 'crq-rate crq-limited' : 'crq-rate' }, model.speed(row)),
+				E('td', { 'class': row && row.en ? 'crq-rate crq-limited' : 'crq-rate' }, [model.speed(row),
+					row?.en === 1 && row.active === 0 ? E('small', {}, _('Inactive')) : null]),
 				E('td', { 'class': 'crq-forward' }, !row || !model.flags(row) ? _('Unknown') :
+					row.bridge_port === 0 ? _('Standalone port') :
 					row.mcast_flood && row.bcast_flood ? _('Default forwarding') :
 					[row.mcast_flood ? null : _('Multicast restricted'), row.bcast_flood ? null : _('Broadcast restricted')].filter(Boolean).join(' · ')),
 				this.writable ? E('td', { 'class': 'crq-row-action' }, edit) : null]);
@@ -154,6 +156,7 @@ return view.extend({
 		ports = ports.filter(port => this.state.ports[port] && model.flags(this.state.ports[port]));
 		if (!ports.length) return;
 		const original = this.state, seed = model.seed(original.ports[ports[0]]);
+		const editFlags = !bulk && this.features.port_flood_flags && original.ports[ports[0]].bridge_port !== 0;
 		if (bulk) { seed.enable = true; seed.rate = '100'; }
 		const fields = this.limitFields(seed), chosen = [];
 		const content = [E('p', { 'class': 'crq-hint' }, bulk ? _('Choose the sockets that should share this speed limit. Forwarding settings are kept for each port.') : _('Applies to traffic leaving this socket, toward its connected device.'))];
@@ -166,9 +169,9 @@ return view.extend({
 		const mcast = E('input', { type: 'checkbox', 'aria-label': _('Allow unknown multicast') }); mcast.checked = seed.mcast;
 		const bcast = E('input', { type: 'checkbox', 'aria-label': _('Allow broadcast') }); bcast.checked = seed.bcast;
 		const advanced = [field(_('Burst size (bytes)'), fields.burst, _('Leave the default 65536 unless you need different burst handling.'))];
-		if (!bulk && this.features.port_flood_flags) advanced.push(field(_('Allow unknown multicast'), mcast), field(_('Allow broadcast'), bcast),
+		if (editFlags) advanced.push(field(_('Allow unknown multicast'), mcast), field(_('Allow broadcast'), bcast),
 			E('p', { 'class': 'crq-hint' }, _('Restricting forwarding can disrupt discovery and address resolution.')));
-		content.push(details(_('Advanced'), _('Burst size') + (!bulk && this.features.port_flood_flags ? ' · ' + _('Forwarding') : ''), advanced));
+		content.push(details(_('Advanced'), _('Burst size') + (editFlags ? ' · ' + _('Forwarding') : ''), advanced));
 		if (original.global === 0) content.push(E('p', { 'class': 'crq-hint' }, _('Applies now; startup restore is off.')));
 		this.modal(bulk ? _('Set several ports') : model.label(ports[0]), content, async () => {
 			const selected = bulk ? chosen.filter(x => x.check.checked).map(x => x.port) : ports;
@@ -184,8 +187,8 @@ return view.extend({
 					const before = original.ports[payload[0]];
 					const sameLimit = before.en === payload[1] && (!before.en || before.rate_kbps === payload[2] && before.burst_bytes === payload[3]);
 					const sameFlood = before.mcast_flood === payload[4] && before.bcast_flood === payload[5];
-					if (!sameLimit) this.accept(await callPort.apply(null, payload));
-					else if (!sameFlood) this.accept(await callFlood(payload[0], payload[4], payload[5]));
+					if (!sameLimit) this.accept(await callPort(...payload.slice(0, 4)));
+					if (editFlags && !sameFlood) this.accept(await callFlood(payload[0], payload[4], payload[5]));
 					completed++;
 				}
 				this.message = _('Port settings saved.');
